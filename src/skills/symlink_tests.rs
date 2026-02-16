@@ -49,20 +49,17 @@ mod tests {
             assert!(content.is_err());
         }
 
-        // Test case 3: Non-Unix platforms should handle symlink errors gracefully
-        #[cfg(not(unix))]
+        // Test case 3: Non-Unix platforms cannot use unix symlinks
+        #[cfg(unix)]
         {
             let source_dir = tmp.path().join("source_skill");
             std::fs::create_dir_all(&source_dir).unwrap();
 
             let dest_link = skills_path.join("linked_skill");
 
-            // Symlink should fail on non-Unix
+            // Unix symlink should work on Unix platforms
             let result = std::os::unix::fs::symlink(&source_dir, &dest_link);
-            assert!(result.is_err());
-
-            // Directory should not exist
-            assert!(!dest_link.exists());
+            assert!(result.is_ok());
         }
 
         // Test case 4: skills_dir function edge cases

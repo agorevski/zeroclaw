@@ -1,6 +1,8 @@
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+
 
 /// A single message in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,6 +146,23 @@ pub trait Provider: Send + Sync {
             .await
     }
 
+    /// Multi-turn conversation with streaming output.
+    ///
+    /// Sends text chunks through `tx` as they arrive, and returns the full
+    /// accumulated response. Default implementation falls back to non-streaming
+    /// `chat_with_history` and sends the complete response as a single chunk.
+    async fn stream_chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+        tx: mpsc::UnboundedSender<String>,
+    ) -> anyhow::Result<String> {
+        let response = self.chat_with_history(messages, model, temperature).await?;
+        let _ = tx.send(response.clone());
+        Ok(response)
+    }
+
     /// Structured chat API for agent loop callers.
     async fn chat(
         &self,
@@ -237,5 +256,42 @@ mod tests {
         }]);
         let json = serde_json::to_string(&tool_result).unwrap();
         assert!(json.contains("\"type\":\"ToolResults\""));
+    }
+
+    /// Mock provider for testing the default stream_chat_with_history implementation.
+    struct MockStreamProvider {
+        response: String,
+    }
+
+    #[async_trait]
+    impl Provider for MockStreamProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(self.response.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_default_sends_full_response_as_single_chunk() {
+        let provider = MockStreamProvider {
+            response: "Hello, world!".into(),
+        };
+        let messages = vec![ChatMessage::user("hi")];
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = provider
+            .stream_chat_with_history(&messages, "test", 0.7, tx)
+            .await
+            .unwrap();
+        assert_eq!(result, "Hello, world!");
+
+        // Should receive exactly one chunk with the full response
+        let chunk = rx.recv().await.unwrap();
+        assert_eq!(chunk, "Hello, world!");
+        assert!(rx.recv().await.is_none());
     }
 }

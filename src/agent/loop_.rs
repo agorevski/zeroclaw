@@ -462,37 +462,82 @@ pub(crate) async fn run_tool_call_loop(
         });
 
         let llm_started_at = Instant::now();
-        let response = match provider
-            .chat_with_history(history, model, temperature)
-            .await
-        {
-            Ok(resp) => {
-                observer.record_event(&ObserverEvent::LlmResponse {
-                    provider: provider_name.to_string(),
-                    model: model.to_string(),
-                    duration: llm_started_at.elapsed(),
-                    success: true,
-                    error_message: None,
-                });
-                resp
+
+        // Use streaming when output is not silent (console mode)
+        let response = if !silent {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+            let stream_result = {
+                let print_future = async {
+                    while let Some(chunk) = rx.recv().await {
+                        print!("{chunk}");
+                        let _ = std::io::stdout().flush();
+                    }
+                };
+
+                let provider_future =
+                    provider.stream_chat_with_history(history, model, temperature, tx);
+
+                let (result, _) = tokio::join!(provider_future, print_future);
+                result
+            };
+
+            match stream_result {
+                Ok(resp) => {
+                    observer.record_event(&ObserverEvent::LlmResponse {
+                        provider: provider_name.to_string(),
+                        model: model.to_string(),
+                        duration: llm_started_at.elapsed(),
+                        success: true,
+                        error_message: None,
+                    });
+                    resp
+                }
+                Err(e) => {
+                    observer.record_event(&ObserverEvent::LlmResponse {
+                        provider: provider_name.to_string(),
+                        model: model.to_string(),
+                        duration: llm_started_at.elapsed(),
+                        success: false,
+                        error_message: Some(crate::providers::sanitize_api_error(&e.to_string())),
+                    });
+                    return Err(e);
+                }
             }
-            Err(e) => {
-                observer.record_event(&ObserverEvent::LlmResponse {
-                    provider: provider_name.to_string(),
-                    model: model.to_string(),
-                    duration: llm_started_at.elapsed(),
-                    success: false,
-                    error_message: Some(crate::providers::sanitize_api_error(&e.to_string())),
-                });
-                return Err(e);
+        } else {
+            // Silent mode: non-streaming for channel use
+            match provider
+                .chat_with_history(history, model, temperature)
+                .await
+            {
+                Ok(resp) => {
+                    observer.record_event(&ObserverEvent::LlmResponse {
+                        provider: provider_name.to_string(),
+                        model: model.to_string(),
+                        duration: llm_started_at.elapsed(),
+                        success: true,
+                        error_message: None,
+                    });
+                    resp
+                }
+                Err(e) => {
+                    observer.record_event(&ObserverEvent::LlmResponse {
+                        provider: provider_name.to_string(),
+                        model: model.to_string(),
+                        duration: llm_started_at.elapsed(),
+                        success: false,
+                        error_message: Some(crate::providers::sanitize_api_error(&e.to_string())),
+                    });
+                    return Err(e);
+                }
             }
         };
 
         let response_text = response;
-        let mut assistant_history_content = response_text.clone();
+        let assistant_history_content = response_text.clone();
         let (parsed_text, tool_calls) = parse_tool_calls(&response_text);
-        let mut parsed_text = parsed_text;
-        let mut tool_calls = tool_calls;
+        let parsed_text = parsed_text;
+        let tool_calls = tool_calls;
 
         if tool_calls.is_empty() {
             // No tool calls — this is the final response
@@ -504,11 +549,8 @@ pub(crate) async fn run_tool_call_loop(
             });
         }
 
-        // Print any text the LLM produced alongside tool calls (unless silent)
-        if !silent && !parsed_text.is_empty() {
-            print!("{parsed_text}");
-            let _ = std::io::stdout().flush();
-        }
+        // Text alongside tool calls was already streamed to console (if !silent)
+        // For silent mode, no output is needed
 
         // Execute each tool call and build results
         let mut tool_results = String::new();
@@ -845,7 +887,8 @@ pub async fn run(
             false,
         )
         .await?;
-        println!("{response}");
+        // Response was already streamed to console; just add a trailing newline
+        println!();
         observer.record_event(&ObserverEvent::TurnComplete);
 
         // Auto-save assistant response to daily log
@@ -914,7 +957,8 @@ pub async fn run(
                     continue;
                 }
             };
-            println!("\n{response}\n");
+            // Response was already streamed to console; add spacing
+            println!("\n");
             observer.record_event(&ObserverEvent::TurnComplete);
 
             // Auto-compaction before hard trimming to preserve long-context signal.

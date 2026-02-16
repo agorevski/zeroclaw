@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 /// Check if an error is non-retryable (client errors that won't resolve with retries).
 fn is_non_retryable(err: &anyhow::Error) -> bool {
@@ -336,6 +337,40 @@ impl Provider for ReliableProvider {
             "All providers/models failed. Attempts:\n{}",
             failures.join("\n")
         )
+    }
+
+    async fn stream_chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+        tx: mpsc::UnboundedSender<String>,
+    ) -> anyhow::Result<String> {
+        let models = self.model_chain(model);
+        let first_model = models.first().copied().unwrap_or(model);
+
+        // Try streaming with the first provider
+        if let Some((_, provider)) = self.providers.first() {
+            match provider
+                .stream_chat_with_history(messages, first_model, temperature, tx.clone())
+                .await
+            {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    if is_non_retryable(&e) {
+                        return Err(e);
+                    }
+                    tracing::warn!("Streaming attempt failed, falling back to non-streaming retry");
+                }
+            }
+        }
+
+        // Fall back to non-streaming retry path
+        let response = self
+            .chat_with_history(messages, model, temperature)
+            .await?;
+        let _ = tx.send(response.clone());
+        Ok(response)
     }
 }
 
@@ -835,5 +870,77 @@ mod tests {
                 .chat_with_system(system_prompt, message, model, temperature)
                 .await
         }
+    }
+
+    #[tokio::test]
+    async fn stream_delegates_to_first_provider() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(MockProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: 0,
+                    response: "streamed ok",
+                    error: "boom",
+                }),
+            )],
+            2,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let result = provider
+            .stream_chat_with_history(&messages, "test", 0.0, tx)
+            .await
+            .unwrap();
+        assert_eq!(result, "streamed ok");
+
+        let chunk = rx.recv().await.unwrap();
+        assert_eq!(chunk, "streamed ok");
+    }
+
+    #[tokio::test]
+    async fn stream_falls_back_on_failure() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(MockProvider {
+                        calls: Arc::clone(&primary_calls),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "temporary error",
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(MockProvider {
+                        calls: Arc::clone(&fallback_calls),
+                        fail_until_attempt: 0,
+                        response: "fallback ok",
+                        error: "fallback err",
+                    }),
+                ),
+            ],
+            1,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let result = provider
+            .stream_chat_with_history(&messages, "test", 0.0, tx)
+            .await
+            .unwrap();
+        assert_eq!(result, "fallback ok");
+
+        // Should receive the fallback response as a single chunk
+        let chunk = rx.recv().await.unwrap();
+        assert_eq!(chunk, "fallback ok");
     }
 }

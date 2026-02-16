@@ -2,6 +2,7 @@ use super::traits::{ChatMessage, ChatRequest, ChatResponse};
 use super::Provider;
 use async_trait::async_trait;
 use std::collections::HashMap;
+use tokio::sync::mpsc;
 
 /// A single route: maps a task hint to a provider + model combo.
 #[derive(Debug, Clone)]
@@ -135,6 +136,20 @@ impl Provider for RouterProvider {
         let (provider_idx, resolved_model) = self.resolve(model);
         let (_, provider) = &self.providers[provider_idx];
         provider.chat(request, &resolved_model, temperature).await
+    }
+
+    async fn stream_chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+        tx: mpsc::UnboundedSender<String>,
+    ) -> anyhow::Result<String> {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        let (_, provider) = &self.providers[provider_idx];
+        provider
+            .stream_chat_with_history(messages, &resolved_model, temperature, tx)
+            .await
     }
 
     fn supports_native_tools(&self) -> bool {
