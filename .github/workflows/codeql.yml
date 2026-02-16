@@ -1,0 +1,36 @@
+name: CodeQL
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+        branches: [main]
+    schedule:
+        - cron: "30 5 * * 1" # Weekly on Monday 5:30am UTC
+
+concurrency:
+    group: codeql-${{ github.event.pull_request.number || github.ref }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+    security-events: write
+
+jobs:
+    analyze:
+        name: Analyze (Rust)
+        runs-on: ${{ github.event_name != 'pull_request' && fromJSON('["self-hosted","Linux","X64","lxc-ci"]') || 'ubuntu-latest' }}
+        timeout-minutes: 30
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Initialize CodeQL
+              uses: github/codeql-action/init@f5c2471be782132e47a6e6f9c725e56730d6e9a3 # v3.32.3
+              with:
+                  languages: rust
+                  build-mode: none
+
+            - name: Perform CodeQL Analysis
+              uses: github/codeql-action/analyze@f5c2471be782132e47a6e6f9c725e56730d6e9a3 # v3.32.3
+              with:
+                  category: "/language:rust"

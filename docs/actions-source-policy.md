@@ -19,6 +19,7 @@ Selected allowlist patterns:
 - `DavidAnson/markdownlint-cli2-action@*`
 - `lycheeverse/lychee-action@*`
 - `EmbarkStudios/cargo-deny-action@*`
+- `github/codeql-action@*`
 - `rhysd/actionlint@*`
 - `softprops/action-gh-release@*`
 - `sigstore/cosign-installer@*`
