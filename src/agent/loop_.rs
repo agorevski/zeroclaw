@@ -567,7 +567,14 @@ pub(crate) async fn run_tool_call_loop(
         Vec::new()
     };
 
-    for _iteration in 0..MAX_TOOL_ITERATIONS {
+    for iteration in 0..MAX_TOOL_ITERATIONS {
+        tracing::debug!(
+            iteration = iteration,
+            provider = provider_name,
+            model = model,
+            "agent_turn"
+        );
+
         observer.record_event(&ObserverEvent::LlmRequest {
             provider: provider_name.to_string(),
             model: model.to_string(),
@@ -712,6 +719,12 @@ pub(crate) async fn run_tool_call_loop(
             observer.record_event(&ObserverEvent::ToolCallStart {
                 tool: call.name.clone(),
             });
+            let input_size = call.arguments.to_string().len();
+            tracing::debug!(
+                tool.name = %call.name,
+                input_size = input_size,
+                "tool_execution"
+            );
             let start = Instant::now();
             let result = if let Some(tool) = find_tool(tools_registry, &call.name) {
                 match tool.execute(call.arguments.clone()).await {
