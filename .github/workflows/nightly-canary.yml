@@ -1,0 +1,102 @@
+name: Nightly Toolchain Canary
+
+on:
+    schedule:
+        # Weekly: Monday at 06:00 UTC
+        - cron: "0 6 * * 1"
+    workflow_dispatch:
+
+permissions:
+    contents: read
+    issues: write
+
+env:
+    CARGO_TERM_COLOR: always
+
+jobs:
+    nightly-check:
+        name: Build & Test (nightly)
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 30
+        continue-on-error: true
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: nightly
+                  components: rustfmt, clippy
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+              with:
+                  key: nightly
+
+            - name: Rust version
+              run: rustc --version && cargo --version
+
+            - name: Check (compile)
+              run: cargo check --all-targets
+
+            - name: Clippy (warnings only)
+              run: cargo clippy --all-targets 2>&1 || true
+
+            - name: Test
+              run: cargo test
+
+    report:
+        name: Report Nightly Failures
+        needs: [nightly-check]
+        if: failure()
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        permissions:
+            contents: read
+            issues: write
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - name: Create issue for nightly failure
+              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+              with:
+                  script: |
+                      const title = `Nightly toolchain canary failure (${new Date().toISOString().split('T')[0]})`;
+
+                      // Check if an open issue already exists
+                      const { data: issues } = await github.rest.issues.listForRepo({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        state: 'open',
+                        labels: 'nightly-canary',
+                        per_page: 5,
+                      });
+
+                      if (issues.length > 0) {
+                        // Add a comment to the existing issue
+                        await github.rest.issues.createComment({
+                          owner: context.repo.owner,
+                          repo: context.repo.repo,
+                          issue_number: issues[0].number,
+                          body: `Another nightly canary failure detected.\n\nRun: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+                        });
+                        core.info(`Updated existing issue #${issues[0].number}`);
+                        return;
+                      }
+
+                      // Create a new issue
+                      await github.rest.issues.create({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        title,
+                        labels: ['nightly-canary'],
+                        body: [
+                          '## Nightly Toolchain Canary Failure',
+                          '',
+                          'The weekly nightly Rust toolchain canary detected issues.',
+                          'This provides early warning of upcoming breaking changes before the pinned toolchain is bumped.',
+                          '',
+                          `**Run:** ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+                          '',
+                          '### Next Steps',
+                          '',
+                          '1. Review the failing CI run for specific errors',
+                          '2. Determine if the failure is a Rust nightly regression or a codebase issue',
+                          '3. If actionable, open a follow-up PR to address the issue',
+                          '4. Close this issue once resolved or confirmed as a transient nightly issue',
+                        ].join('\n'),
+                      });
