@@ -1,5 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::memory::Memory;
+use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -7,11 +8,12 @@ use std::sync::Arc;
 /// Let the agent forget/delete a memory entry
 pub struct MemoryForgetTool {
     memory: Arc<dyn Memory>,
+    security: Arc<SecurityPolicy>,
 }
 
 impl MemoryForgetTool {
-    pub fn new(memory: Arc<dyn Memory>) -> Self {
-        Self { memory }
+    pub fn new(memory: Arc<dyn Memory>, security: Arc<SecurityPolicy>) -> Self {
+        Self { memory, security }
     }
 }
 
@@ -39,6 +41,25 @@ impl Tool for MemoryForgetTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        // Memory deletion requires action-level autonomy
+        if !self.security.can_act() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(
+                    "Action blocked: memory_forget requires autonomy above read-only".into(),
+                ),
+            });
+        }
+
+        if !self.security.record_action() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Action blocked: rate limit exceeded".into()),
+            });
+        }
+
         let key = args
             .get("key")
             .and_then(|v| v.as_str())
@@ -68,6 +89,7 @@ impl Tool for MemoryForgetTool {
 mod tests {
     use super::*;
     use crate::memory::{MemoryCategory, SqliteMemory};
+    use crate::security::AutonomyLevel;
     use tempfile::TempDir;
 
     fn test_mem() -> (TempDir, Arc<dyn Memory>) {
@@ -76,10 +98,17 @@ mod tests {
         (tmp, Arc::new(mem))
     }
 
+    fn test_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        })
+    }
+
     #[test]
     fn name_and_schema() {
         let (_tmp, mem) = test_mem();
-        let tool = MemoryForgetTool::new(mem);
+        let tool = MemoryForgetTool::new(mem, test_security());
         assert_eq!(tool.name(), "memory_forget");
         assert!(tool.parameters_schema()["properties"]["key"].is_object());
     }
@@ -91,7 +120,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = MemoryForgetTool::new(mem.clone());
+        let tool = MemoryForgetTool::new(mem.clone(), test_security());
         let result = tool.execute(json!({"key": "temp"})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("Forgot"));
@@ -102,7 +131,7 @@ mod tests {
     #[tokio::test]
     async fn forget_nonexistent() {
         let (_tmp, mem) = test_mem();
-        let tool = MemoryForgetTool::new(mem);
+        let tool = MemoryForgetTool::new(mem, test_security());
         let result = tool.execute(json!({"key": "nope"})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("No memory found"));
@@ -111,8 +140,21 @@ mod tests {
     #[tokio::test]
     async fn forget_missing_key() {
         let (_tmp, mem) = test_mem();
-        let tool = MemoryForgetTool::new(mem);
+        let tool = MemoryForgetTool::new(mem, test_security());
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn forget_blocked_in_readonly_mode() {
+        let (_tmp, mem) = test_mem();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        });
+        let tool = MemoryForgetTool::new(mem, security);
+        let result = tool.execute(json!({"key": "k"})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("autonomy"));
     }
 }

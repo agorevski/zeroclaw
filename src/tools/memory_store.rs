@@ -1,5 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::memory::{Memory, MemoryCategory};
+use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -7,11 +8,12 @@ use std::sync::Arc;
 /// Let the agent store memories — its own brain writes
 pub struct MemoryStoreTool {
     memory: Arc<dyn Memory>,
+    security: Arc<SecurityPolicy>,
 }
 
 impl MemoryStoreTool {
-    pub fn new(memory: Arc<dyn Memory>) -> Self {
-        Self { memory }
+    pub fn new(memory: Arc<dyn Memory>, security: Arc<SecurityPolicy>) -> Self {
+        Self { memory, security }
     }
 }
 
@@ -48,6 +50,23 @@ impl Tool for MemoryStoreTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        // Memory mutation requires action-level autonomy
+        if !self.security.can_act() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Action blocked: memory_store requires autonomy above read-only".into()),
+            });
+        }
+
+        if !self.security.record_action() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Action blocked: rate limit exceeded".into()),
+            });
+        }
+
         let key = args
             .get("key")
             .and_then(|v| v.as_str())
@@ -83,6 +102,7 @@ impl Tool for MemoryStoreTool {
 mod tests {
     use super::*;
     use crate::memory::SqliteMemory;
+    use crate::security::AutonomyLevel;
     use tempfile::TempDir;
 
     fn test_mem() -> (TempDir, Arc<dyn Memory>) {
@@ -91,10 +111,17 @@ mod tests {
         (tmp, Arc::new(mem))
     }
 
+    fn test_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        })
+    }
+
     #[test]
     fn name_and_schema() {
         let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem);
+        let tool = MemoryStoreTool::new(mem, test_security());
         assert_eq!(tool.name(), "memory_store");
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["key"].is_object());
@@ -104,7 +131,7 @@ mod tests {
     #[tokio::test]
     async fn store_core() {
         let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem.clone());
+        let tool = MemoryStoreTool::new(mem.clone(), test_security());
         let result = tool
             .execute(json!({"key": "lang", "content": "Prefers Rust"}))
             .await
@@ -120,7 +147,7 @@ mod tests {
     #[tokio::test]
     async fn store_with_category() {
         let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem.clone());
+        let tool = MemoryStoreTool::new(mem.clone(), test_security());
         let result = tool
             .execute(json!({"key": "note", "content": "Fixed bug", "category": "daily"}))
             .await
@@ -131,7 +158,7 @@ mod tests {
     #[tokio::test]
     async fn store_missing_key() {
         let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem);
+        let tool = MemoryStoreTool::new(mem, test_security());
         let result = tool.execute(json!({"content": "no key"})).await;
         assert!(result.is_err());
     }
@@ -139,8 +166,24 @@ mod tests {
     #[tokio::test]
     async fn store_missing_content() {
         let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem);
+        let tool = MemoryStoreTool::new(mem, test_security());
         let result = tool.execute(json!({"key": "no_content"})).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn store_blocked_in_readonly_mode() {
+        let (_tmp, mem) = test_mem();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        });
+        let tool = MemoryStoreTool::new(mem, security);
+        let result = tool
+            .execute(json!({"key": "k", "content": "v"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("autonomy"));
     }
 }

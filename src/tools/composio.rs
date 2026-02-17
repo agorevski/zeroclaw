@@ -7,11 +7,13 @@
 // The Composio API key is stored in the encrypted secret store.
 
 use super::traits::{Tool, ToolResult};
+use crate::security::SecurityPolicy;
 use anyhow::Context;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::sync::Arc;
 
 const COMPOSIO_API_BASE_V2: &str = "https://backend.composio.dev/api/v2";
 const COMPOSIO_API_BASE_V3: &str = "https://backend.composio.dev/api/v3";
@@ -21,10 +23,11 @@ pub struct ComposioTool {
     api_key: String,
     default_entity_id: String,
     client: Client,
+    security: Arc<SecurityPolicy>,
 }
 
 impl ComposioTool {
-    pub fn new(api_key: &str, default_entity_id: Option<&str>) -> Self {
+    pub fn new(api_key: &str, default_entity_id: Option<&str>, security: Arc<SecurityPolicy>) -> Self {
         Self {
             api_key: api_key.to_string(),
             default_entity_id: normalize_entity_id(default_entity_id.unwrap_or("default")),
@@ -33,6 +36,7 @@ impl ComposioTool {
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
+            security,
         }
     }
 
@@ -434,6 +438,28 @@ impl Tool for ComposioTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'action' parameter"))?;
 
+        // Side-effecting actions (execute, connect) require autonomy and rate checks.
+        // Listing is read-only and allowed under any autonomy level.
+        if action != "list" {
+            if !self.security.can_act() {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(
+                        "Action blocked: composio side-effecting actions require autonomy above read-only".into(),
+                    ),
+                });
+            }
+
+            if !self.security.record_action() {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("Action blocked: rate limit exceeded".into()),
+                });
+            }
+        }
+
         let entity_id = args
             .get("entity_id")
             .and_then(|v| v.as_str())
@@ -734,25 +760,33 @@ pub struct ComposioAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::AutonomyLevel;
+
+    fn test_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        })
+    }
 
     // ── Constructor ───────────────────────────────────────────
 
     #[test]
     fn composio_tool_has_correct_name() {
-        let tool = ComposioTool::new("test-key", None);
+        let tool = ComposioTool::new("test-key", None, test_security());
         assert_eq!(tool.name(), "composio");
     }
 
     #[test]
     fn composio_tool_has_description() {
-        let tool = ComposioTool::new("test-key", None);
+        let tool = ComposioTool::new("test-key", None, test_security());
         assert!(!tool.description().is_empty());
         assert!(tool.description().contains("1000+"));
     }
 
     #[test]
     fn composio_tool_schema_has_required_fields() {
-        let tool = ComposioTool::new("test-key", None);
+        let tool = ComposioTool::new("test-key", None, test_security());
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["action"].is_object());
         assert!(schema["properties"]["action_name"].is_object());
@@ -767,7 +801,7 @@ mod tests {
 
     #[test]
     fn composio_tool_spec_roundtrip() {
-        let tool = ComposioTool::new("test-key", None);
+        let tool = ComposioTool::new("test-key", None, test_security());
         let spec = tool.spec();
         assert_eq!(spec.name, "composio");
         assert!(spec.parameters.is_object());
@@ -777,14 +811,14 @@ mod tests {
 
     #[tokio::test]
     async fn execute_missing_action_returns_error() {
-        let tool = ComposioTool::new("test-key", None);
+        let tool = ComposioTool::new("test-key", None, test_security());
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn execute_unknown_action_returns_error() {
-        let tool = ComposioTool::new("test-key", None);
+        let tool = ComposioTool::new("test-key", None, test_security());
         let result = tool.execute(json!({"action": "unknown"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("Unknown action"));
@@ -792,16 +826,46 @@ mod tests {
 
     #[tokio::test]
     async fn execute_without_action_name_returns_error() {
-        let tool = ComposioTool::new("test-key", None);
+        let tool = ComposioTool::new("test-key", None, test_security());
         let result = tool.execute(json!({"action": "execute"})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn connect_without_target_returns_error() {
-        let tool = ComposioTool::new("test-key", None);
+        let tool = ComposioTool::new("test-key", None, test_security());
         let result = tool.execute(json!({"action": "connect"})).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn execute_blocked_in_readonly_mode() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        });
+        let tool = ComposioTool::new("test-key", None, security);
+        let result = tool
+            .execute(json!({"action": "execute", "action_name": "test"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("autonomy"));
+    }
+
+    #[tokio::test]
+    async fn connect_blocked_in_readonly_mode() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        });
+        let tool = ComposioTool::new("test-key", None, security);
+        let result = tool
+            .execute(json!({"action": "connect", "app": "gmail"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("autonomy"));
     }
 
     // ── API response parsing ──────────────────────────────────
