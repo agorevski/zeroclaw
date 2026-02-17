@@ -1,0 +1,96 @@
+name: Reproducible Release Verification
+
+on:
+    workflow_run:
+        workflows: ["Release"]
+        types: [completed]
+        branches: [main]
+
+concurrency:
+    group: reproducible-release
+    cancel-in-progress: false
+
+permissions:
+    contents: read
+
+env:
+    CARGO_TERM_COLOR: always
+
+jobs:
+    verify:
+        name: Verify Reproducible Build (${{ matrix.target }})
+        if: github.event.workflow_run.conclusion == 'success'
+        runs-on: ${{ matrix.os }}
+        timeout-minutes: 45
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - os: ubuntu-latest
+                      target: x86_64-unknown-linux-gnu
+                      artifact: zeroclaw
+                      package: zeroclaw-x86_64-unknown-linux-gnu.tar.gz
+
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              with:
+                  ref: ${{ github.event.workflow_run.head_sha }}
+
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  targets: ${{ matrix.target }}
+
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+            - name: Rebuild from source
+              run: cargo build --release --locked --target ${{ matrix.target }}
+
+            - name: Compute rebuild checksum
+              id: rebuild
+              run: |
+                  REBUILD_SHA=$(sha256sum target/${{ matrix.target }}/release/${{ matrix.artifact }} | cut -d' ' -f1)
+                  echo "sha256=${REBUILD_SHA}" >> "$GITHUB_OUTPUT"
+                  echo "Rebuild SHA256: ${REBUILD_SHA}"
+
+            - name: Download release artifact
+              run: |
+                  TAG_NAME="${{ github.event.workflow_run.head_branch }}"
+                  if [ -z "$TAG_NAME" ]; then
+                    TAG_NAME=$(git describe --tags --exact-match ${{ github.event.workflow_run.head_sha }} 2>/dev/null || echo "")
+                  fi
+                  if [ -z "$TAG_NAME" ]; then
+                    echo "Could not determine release tag. Skipping verification."
+                    echo "skip=true" >> "$GITHUB_OUTPUT"
+                    exit 0
+                  fi
+                  DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/${TAG_NAME}/${{ matrix.package }}"
+                  echo "Downloading: ${DOWNLOAD_URL}"
+                  curl -sSfL -o release-artifact.tar.gz "${DOWNLOAD_URL}" || {
+                    echo "::warning::Could not download release artifact. Release may not be published yet."
+                    echo "skip=true" >> "$GITHUB_OUTPUT"
+                    exit 0
+                  }
+              id: download
+
+            - name: Extract and compare checksums
+              if: steps.download.outputs.skip != 'true'
+              run: |
+                  tar xzf release-artifact.tar.gz
+                  RELEASE_SHA=$(sha256sum ${{ matrix.artifact }} | cut -d' ' -f1)
+                  REBUILD_SHA="${{ steps.rebuild.outputs.sha256 }}"
+
+                  echo "Release SHA256:  ${RELEASE_SHA}"
+                  echo "Rebuild SHA256:  ${REBUILD_SHA}"
+
+                  echo "### Reproducible Build Verification" >> "$GITHUB_STEP_SUMMARY"
+                  echo "- Target: \`${{ matrix.target }}\`" >> "$GITHUB_STEP_SUMMARY"
+                  echo "- Release SHA256: \`${RELEASE_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+                  echo "- Rebuild SHA256: \`${REBUILD_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+
+                  if [ "$RELEASE_SHA" = "$REBUILD_SHA" ]; then
+                    echo "✅ Checksums match — build is reproducible."
+                    echo "- Result: ✅ **Match**" >> "$GITHUB_STEP_SUMMARY"
+                  else
+                    echo "::warning::Checksums differ. Build may not be fully reproducible."
+                    echo "- Result: ⚠️ **Mismatch** (informational)" >> "$GITHUB_STEP_SUMMARY"
+                  fi
