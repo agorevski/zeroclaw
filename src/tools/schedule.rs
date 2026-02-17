@@ -65,6 +65,14 @@ impl Tool for ScheduleTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult> {
+        if !self.config.cron.enabled {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("cron is disabled by config (cron.enabled=false)".to_string()),
+            });
+        }
+
         let action = args
             .get("action")
             .and_then(|value| value.as_str())
@@ -225,6 +233,15 @@ impl ScheduleTool {
             .and_then(|value| value.as_str())
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("Missing or empty 'command' parameter"))?;
+
+        // Validate command against security policy before persisting
+        if !self.security.is_command_allowed(command) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Command blocked by security policy: {command}")),
+            });
+        }
 
         let expression = args.get("expression").and_then(|value| value.as_str());
         let delay = args.get("delay").and_then(|value| value.as_str());
@@ -520,5 +537,65 @@ mod tests {
         let result = tool.execute(json!({"action": "explode"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap().contains("Unknown action"));
+    }
+
+    #[tokio::test]
+    async fn cron_disabled_blocks_all_mutations() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.cron.enabled = false;
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let security = Arc::new(SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        let tool = ScheduleTool::new(security, config);
+
+        let result = tool
+            .execute(json!({
+                "action": "create",
+                "expression": "*/5 * * * *",
+                "command": "echo blocked"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap().contains("cron.enabled"));
+    }
+
+    #[tokio::test]
+    async fn blocks_disallowed_command() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.autonomy.allowed_commands = vec!["echo".into()];
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let security = Arc::new(SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        let tool = ScheduleTool::new(security, config);
+
+        let result = tool
+            .execute(json!({
+                "action": "add",
+                "expression": "*/5 * * * *",
+                "command": "curl https://example.com"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("blocked by security policy"));
     }
 }
