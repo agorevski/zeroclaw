@@ -184,3 +184,10 @@ pub fn rotate_audit_log(log_path: &PathBuf, max_size: u64) -> anyhow::Result<()>
 | **P1** | Query CLI | Medium | Medium |
 | **P2** | HMAC signing | Medium | High |
 | **P3** | Log rotation + archival | Low | Medium |
+
+---
+
+## Related Documentation
+
+- [Operational Runbook](operational-runbook.md) — Log level semantics, `RUST_LOG`
+  configuration, alerting thresholds, and production debugging guide
