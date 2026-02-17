@@ -55,6 +55,9 @@ jobs:
                   toolchain: 1.92.0
                   components: rustfmt, clippy
             - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+              with:
+                  shared-key: ci-lint
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
             - name: Run rust quality gate
               run: ./scripts/ci/rust_quality_gate.sh
 
@@ -73,6 +76,9 @@ jobs:
                   toolchain: 1.92.0
                   components: clippy
             - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+              with:
+                  shared-key: ci-lint
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
             - name: Run strict lint delta gate
               env:
                   BASE_SHA: ${{ needs.changes.outputs.base_sha }}
@@ -90,6 +96,9 @@ jobs:
               with:
                   toolchain: 1.92.0
             - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+              with:
+                  shared-key: ci-test
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
             - name: Run tests
               run: cargo test --locked --verbose
 
@@ -106,6 +115,9 @@ jobs:
               with:
                   toolchain: 1.92.0
             - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+              with:
+                  shared-key: ci-build
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
             - name: Build release binary
               run: cargo build --release --locked --verbose
 
