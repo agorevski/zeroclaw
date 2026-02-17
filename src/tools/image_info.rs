@@ -169,15 +169,36 @@ impl Tool for ImageInfoTool {
             });
         }
 
-        if !path.exists() {
+        // Resolve from workspace root, canonicalize, then re-check containment
+        let full_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.security.workspace_dir.join(path)
+        };
+
+        let resolved_path = match tokio::fs::canonicalize(&full_path).await {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to resolve image path: {e}")),
+                });
+            }
+        };
+
+        if !self.security.is_resolved_path_allowed(&resolved_path) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("File not found: {path_str}")),
+                error: Some(format!(
+                    "Resolved path escapes workspace: {}",
+                    resolved_path.display()
+                )),
             });
         }
 
-        let metadata = tokio::fs::metadata(path)
+        let metadata = tokio::fs::metadata(&resolved_path)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read file metadata: {e}"))?;
 
@@ -193,7 +214,7 @@ impl Tool for ImageInfoTool {
             });
         }
 
-        let bytes = tokio::fs::read(path)
+        let bytes = tokio::fs::read(&resolved_path)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read image file: {e}"))?;
 
@@ -421,7 +442,32 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("not found"));
+        assert!(result.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_path_outside_workspace() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir().join("zeroclaw_img_confined"),
+            workspace_only: true,
+            forbidden_paths: vec![],
+            ..SecurityPolicy::default()
+        });
+        let _ = std::fs::create_dir_all(&security.workspace_dir);
+        let tool = ImageInfoTool::new(security);
+        let result = tool
+            .execute(json!({"path": "/etc/passwd"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap();
+        assert!(
+            err.contains("not allowed")
+                || err.contains("escapes workspace")
+                || err.contains("Failed to resolve"),
+            "Expected path rejection, got: {err}"
+        );
     }
 
     #[tokio::test]
