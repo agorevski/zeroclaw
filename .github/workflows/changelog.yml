@@ -1,0 +1,46 @@
+name: Changelog
+
+on:
+    push:
+        tags: ["v*"]
+
+concurrency:
+    group: changelog
+    cancel-in-progress: false
+
+permissions:
+    contents: write
+
+jobs:
+    generate:
+        name: Generate Changelog
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 10
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              with:
+                  fetch-depth: 0
+
+            - name: Install git-cliff
+              run: |
+                  curl -sSfL https://github.com/orhun/git-cliff/releases/latest/download/git-cliff-x86_64-unknown-linux-gnu.tar.gz \
+                    | tar xz -C /usr/local/bin --strip-components=1 git-cliff-x86_64-unknown-linux-gnu/git-cliff
+                  git-cliff --version
+
+            - name: Generate changelog
+              run: |
+                  git-cliff --config cliff.toml --output CHANGELOG.md
+                  echo "### Changelog Generated" >> "$GITHUB_STEP_SUMMARY"
+                  echo "Changelog updated for tag ${GITHUB_REF_NAME}" >> "$GITHUB_STEP_SUMMARY"
+
+            - name: Commit changelog
+              run: |
+                  git config user.name "github-actions[bot]"
+                  git config user.email "github-actions[bot]@users.noreply.github.com"
+                  git add CHANGELOG.md
+                  if git diff --cached --quiet; then
+                    echo "No changelog changes to commit."
+                  else
+                    git commit -m "docs: update changelog for ${GITHUB_REF_NAME}"
+                    git push origin HEAD:main
+                  fi
