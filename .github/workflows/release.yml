@@ -5,7 +5,7 @@ on:
         tags: ["v*"]
 
 concurrency:
-    group: release-${{ github.ref }}
+    group: release
     cancel-in-progress: false
 
 permissions:
