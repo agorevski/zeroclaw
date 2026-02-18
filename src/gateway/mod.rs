@@ -19,7 +19,7 @@ use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
-    extract::{Query, State},
+    extract::{ConnectInfo, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json},
     routing::{get, post},
@@ -199,13 +199,13 @@ impl IdempotencyStore {
 
 /// Derive the rate-limit identity key from request context.
 ///
-/// Uses "unknown" as the default identity. Forwarded headers
-/// (`X-Forwarded-For`, `X-Real-IP`) are **not** trusted by default
-/// because they are client-spoofable. A future `trust_proxy` config
-/// option can re-enable them for deployments behind trusted reverse
-/// proxies.
-fn client_key_from_headers(_headers: &HeaderMap) -> String {
-    "unknown".into()
+/// Uses transport-level peer address when available. Forwarded headers
+/// (`X-Forwarded-For`, `X-Real-IP`) are intentionally ignored because
+/// they are client-spoofable without trusted-proxy enforcement.
+fn client_key_from_request(peer_addr: Option<SocketAddr>) -> String {
+    peer_addr
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 /// Shared state for all axum handlers
@@ -421,7 +421,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         ));
 
     // Run the server
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }
@@ -441,8 +445,12 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// POST /pair — exchange one-time code for bearer token
-async fn handle_pair(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let client_key = client_key_from_headers(&headers);
+async fn handle_pair(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let client_key = client_key_from_request(Some(peer_addr));
     if !state.rate_limiter.allow_pair(&client_key) {
         tracing::warn!("/pair rate limit exceeded for key: {client_key}");
         let err = serde_json::json!({
@@ -514,10 +522,11 @@ pub struct WebhookBody {
 /// POST /webhook — main webhook endpoint
 async fn handle_webhook(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    let client_key = client_key_from_headers(&headers);
+    let client_key = client_key_from_request(Some(peer_addr));
     if !state.rate_limiter.allow_webhook(&client_key) {
         tracing::warn!("/webhook rate limit exceeded for key: {client_key}");
         let err = serde_json::json!({
@@ -846,7 +855,7 @@ mod tests {
 
     #[test]
     fn rate_limiter_sweep_removes_stale_entries() {
-        let limiter = SlidingWindowRateLimiter::new(10, Duration::from_secs(60));
+        let limiter = SlidingWindowRateLimiter::new(10, Duration::from_secs(60), 100);
         // Add entries for multiple IPs
         assert!(limiter.allow("ip-1"));
         assert!(limiter.allow("ip-2"));
@@ -880,7 +889,7 @@ mod tests {
 
     #[test]
     fn rate_limiter_zero_limit_always_allows() {
-        let limiter = SlidingWindowRateLimiter::new(0, Duration::from_secs(60));
+        let limiter = SlidingWindowRateLimiter::new(0, Duration::from_secs(60), 10);
         for _ in 0..100 {
             assert!(limiter.allow("any-key"));
         }
@@ -892,6 +901,69 @@ mod tests {
         assert!(store.record_if_new("req-1"));
         assert!(!store.record_if_new("req-1"));
         assert!(store.record_if_new("req-2"));
+    }
+
+    #[test]
+    fn rate_limiter_evicts_oldest_key_when_at_capacity() {
+        let limiter = SlidingWindowRateLimiter::new(10, Duration::from_secs(60), 2);
+        assert!(limiter.allow("ip-1"));
+        assert!(limiter.allow("ip-2"));
+
+        {
+            let mut guard = limiter.requests.lock();
+            let stale = Instant::now()
+                .checked_sub(Duration::from_secs(120))
+                .unwrap_or_else(Instant::now);
+            guard.0.get_mut("ip-1").unwrap().clear();
+            guard.0.get_mut("ip-1").unwrap().push(stale);
+        }
+
+        assert!(limiter.allow("ip-3"));
+
+        let guard = limiter.requests.lock();
+        assert_eq!(guard.0.len(), 2);
+        assert!(!guard.0.contains_key("ip-1"));
+        assert!(guard.0.contains_key("ip-2"));
+        assert!(guard.0.contains_key("ip-3"));
+    }
+
+    #[test]
+    fn idempotency_store_evicts_oldest_key_when_at_capacity() {
+        let store = IdempotencyStore {
+            ttl: Duration::from_secs(300),
+            max_keys: 2,
+            keys: Mutex::new(HashMap::new()),
+        };
+
+        assert!(store.record_if_new("k1"));
+        assert!(store.record_if_new("k2"));
+
+        {
+            let mut keys = store.keys.lock();
+            let stale = Instant::now()
+                .checked_sub(Duration::from_secs(120))
+                .unwrap_or_else(Instant::now);
+            *keys.get_mut("k1").unwrap() = stale;
+        }
+
+        assert!(store.record_if_new("k3"));
+
+        let keys = store.keys.lock();
+        assert_eq!(keys.len(), 2);
+        assert!(!keys.contains_key("k1"));
+        assert!(keys.contains_key("k2"));
+        assert!(keys.contains_key("k3"));
+    }
+
+    #[test]
+    fn client_key_uses_peer_ip_when_available() {
+        let peer = SocketAddr::from(([203, 0, 113, 5], 8080));
+        assert_eq!(client_key_from_request(Some(peer)), "203.0.113.5");
+    }
+
+    #[test]
+    fn client_key_falls_back_to_unknown_without_peer_addr() {
+        assert_eq!(client_key_from_request(None), "unknown");
     }
 
     #[test]
@@ -1075,6 +1147,10 @@ mod tests {
         }
     }
 
+    fn test_connect_info() -> ConnectInfo<SocketAddr> {
+        ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 30_300)))
+    }
+
     #[tokio::test]
     async fn webhook_idempotency_skips_duplicate_provider_calls() {
         let provider_impl = Arc::new(MockProvider::default());
@@ -1102,15 +1178,20 @@ mod tests {
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
         }));
-        let first = handle_webhook(State(state.clone()), headers.clone(), body)
-            .await
-            .into_response();
+        let first = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            headers.clone(),
+            body,
+        )
+        .await
+        .into_response();
         assert_eq!(first.status(), StatusCode::OK);
 
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
         }));
-        let second = handle_webhook(State(state), headers, body)
+        let second = handle_webhook(State(state), test_connect_info(), headers, body)
             .await
             .into_response();
         assert_eq!(second.status(), StatusCode::OK);
@@ -1150,15 +1231,20 @@ mod tests {
         let body1 = Ok(Json(WebhookBody {
             message: "hello one".into(),
         }));
-        let first = handle_webhook(State(state.clone()), headers.clone(), body1)
-            .await
-            .into_response();
+        let first = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            headers.clone(),
+            body1,
+        )
+        .await
+        .into_response();
         assert_eq!(first.status(), StatusCode::OK);
 
         let body2 = Ok(Json(WebhookBody {
             message: "hello two".into(),
         }));
-        let second = handle_webhook(State(state), headers, body2)
+        let second = handle_webhook(State(state), test_connect_info(), headers, body2)
             .await
             .into_response();
         assert_eq!(second.status(), StatusCode::OK);
@@ -1205,6 +1291,7 @@ mod tests {
 
         let response = handle_webhook(
             State(state),
+            test_connect_info(),
             HeaderMap::new(),
             Ok(Json(WebhookBody {
                 message: "hello".into(),
@@ -1243,6 +1330,7 @@ mod tests {
 
         let response = handle_webhook(
             State(state),
+            test_connect_info(),
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
@@ -1281,6 +1369,7 @@ mod tests {
 
         let response = handle_webhook(
             State(state),
+            test_connect_info(),
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
