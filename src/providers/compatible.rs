@@ -120,6 +120,11 @@ impl OpenAiCompatibleProvider {
     /// Collect all `system` role messages, concatenate their content,
     /// and prepend to the first `user` message. Drop all system messages.
     /// Used for providers (e.g. MiniMax) that reject `role: system`.
+    ///
+    /// The result is guaranteed to start with a `user` message so that
+    /// providers with strict role-ordering requirements (first message
+    /// must be `user`, messages must alternate user/assistant) receive a
+    /// valid sequence even when prior conversation history was trimmed.
     fn flatten_system_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
         let system_content: String = messages
             .iter()
@@ -137,6 +142,15 @@ impl OpenAiCompatibleProvider {
             .filter(|m| m.role != "system")
             .cloned()
             .collect();
+
+        // Drop orphaned non-user messages that precede the first user
+        // message.  These are artefacts of history trimming (e.g. a
+        // leading assistant reply whose matching user turn was evicted)
+        // and would violate the user-first ordering required by
+        // providers such as MiniMax.
+        while result.first().map_or(false, |m| m.role != "user") {
+            result.remove(0);
+        }
 
         if let Some(first_user) = result.iter_mut().find(|m| m.role == "user") {
             first_user.content = format!("{system_content}\n\n{}", first_user.content);
@@ -1932,13 +1946,14 @@ mod tests {
         ];
 
         let output = OpenAiCompatibleProvider::flatten_system_messages(&input);
-        assert_eq!(output.len(), 3);
-        assert_eq!(output[0].role, "assistant");
-        assert_eq!(output[0].content, "ack");
-        assert_eq!(output[1].role, "user");
-        assert_eq!(output[1].content, "core policy\n\ndelivery rules\n\nhello");
-        assert_eq!(output[2].role, "assistant");
-        assert_eq!(output[2].content, "post-user");
+        // The orphaned assistant ("ack") before the first user message is
+        // dropped so the result starts with `user` — required by providers
+        // like MiniMax that enforce user-first ordering.
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0].role, "user");
+        assert_eq!(output[0].content, "core policy\n\ndelivery rules\n\nhello");
+        assert_eq!(output[1].role, "assistant");
+        assert_eq!(output[1].content, "post-user");
         assert!(output.iter().all(|m| m.role != "system"));
     }
 
@@ -1949,12 +1964,33 @@ mod tests {
             ChatMessage::assistant("ack"),
         ];
 
+        // Orphaned assistant is dropped; no user remains, so a synthetic
+        // user message carries the system content.
         let output = OpenAiCompatibleProvider::flatten_system_messages(&input);
-        assert_eq!(output.len(), 2);
+        assert_eq!(output.len(), 1);
         assert_eq!(output[0].role, "user");
         assert_eq!(output[0].content, "core policy");
-        assert_eq!(output[1].role, "assistant");
-        assert_eq!(output[1].content, "ack");
+    }
+
+    #[test]
+    fn flatten_system_messages_drops_leading_non_user_for_valid_ordering() {
+        // Simulates the channel scenario where history trimming removes
+        // the first user message, leaving an orphaned assistant reply.
+        let input = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::assistant("orphaned reply"),
+            ChatMessage::user("latest question"),
+            ChatMessage::system("delivery instructions"),
+        ];
+
+        let output = OpenAiCompatibleProvider::flatten_system_messages(&input);
+        // Orphaned assistant is dropped; system content is merged into first user.
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].role, "user");
+        assert_eq!(
+            output[0].content,
+            "system prompt\n\ndelivery instructions\n\nlatest question"
+        );
     }
 
     #[test]
@@ -2193,14 +2229,15 @@ mod tests {
         ];
 
         let flattened = OpenAiCompatibleProvider::flatten_system_messages(&messages);
-        assert_eq!(flattened.len(), 3);
-        assert_eq!(flattened[0].role, "assistant");
+        // Orphaned assistant before first user is dropped to satisfy
+        // providers that require user-first ordering.
+        assert_eq!(flattened.len(), 2);
+        assert_eq!(flattened[0].role, "user");
         assert_eq!(
-            flattened[1].content,
+            flattened[0].content,
             "System A\n\nSystem B\n\nUser turn".to_string()
         );
-        assert_eq!(flattened[1].role, "user");
-        assert_eq!(flattened[2].role, "tool");
+        assert_eq!(flattened[1].role, "tool");
         assert!(!flattened.iter().any(|m| m.role == "system"));
     }
 
@@ -2211,11 +2248,12 @@ mod tests {
             ChatMessage::system("Synthetic system"),
         ];
 
+        // Orphaned assistant is dropped; synthetic user carries system
+        // content to satisfy user-first ordering.
         let flattened = OpenAiCompatibleProvider::flatten_system_messages(&messages);
-        assert_eq!(flattened.len(), 2);
+        assert_eq!(flattened.len(), 1);
         assert_eq!(flattened[0].role, "user");
         assert_eq!(flattened[0].content, "Synthetic system");
-        assert_eq!(flattened[1].role, "assistant");
     }
 
     #[test]

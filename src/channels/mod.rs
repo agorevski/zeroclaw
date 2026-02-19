@@ -281,6 +281,12 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
         .saturating_sub(CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
     let mut compacted = turns[keep_from..].to_vec();
 
+    // Ensure compacted history starts with a user message so providers
+    // with strict role-ordering (e.g. MiniMax) get a valid sequence.
+    while compacted.first().map_or(false, |m| m.role != "user") {
+        compacted.remove(0);
+    }
+
     for turn in &mut compacted {
         if turn.content.chars().count() > CHANNEL_HISTORY_COMPACT_CONTENT_CHARS {
             turn.content =
@@ -845,6 +851,12 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 turns.push(ChatMessage::assistant(&response));
                 // Trim to MAX_CHANNEL_HISTORY (keep recent turns)
                 while turns.len() > MAX_CHANNEL_HISTORY {
+                    turns.remove(0);
+                }
+                // Ensure history starts with a user message so providers
+                // with strict role-ordering (e.g. MiniMax) get a valid
+                // conversation sequence after system-message flattening.
+                while turns.first().map_or(false, |m| m.role != "user") {
                     turns.remove(0);
                 }
             }
@@ -2229,6 +2241,71 @@ mod tests {
                 || (len <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS + 3
                     && turn.content.ends_with("..."))
         }));
+    }
+
+    #[test]
+    fn compact_sender_history_ensures_user_first_ordering() {
+        // Build 21 messages so that the kept slice (last 12) starts at
+        // index 9, which is an assistant message. Without the fix, the
+        // compacted history would start with assistant and violate the
+        // user-first ordering required by providers like MiniMax.
+        let mut histories = HashMap::new();
+        let sender = "telegram_u2".to_string();
+        histories.insert(
+            sender.clone(),
+            (0..21)
+                .map(|idx| {
+                    if idx % 2 == 0 {
+                        ChatMessage::user(format!("u-{idx}"))
+                    } else {
+                        ChatMessage::assistant(format!("a-{idx}"))
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        let ctx = ChannelRuntimeContext {
+            channels_by_name: Arc::new(HashMap::new()),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("system".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(histories)),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        };
+
+        assert!(compact_sender_history(&ctx, &sender));
+
+        let histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let kept = histories
+            .get(&sender)
+            .expect("sender history should remain");
+        assert!(
+            !kept.is_empty(),
+            "compacted history should not be empty"
+        );
+        assert_eq!(
+            kept[0].role, "user",
+            "compacted history must start with a user message"
+        );
     }
 
     struct DummyProvider;
