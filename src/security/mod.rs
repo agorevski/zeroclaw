@@ -17,6 +17,11 @@ pub use policy::{AutonomyLevel, SecurityPolicy};
 pub use secrets::SecretStore;
 #[allow(unused_imports)]
 pub use traits::{NoopSandbox, Sandbox};
+#[allow(unused_imports)]
+pub use traits::{
+    AuditFinding, AuditSeverity, DmAccessPolicy, DmPolicyManager, ExecApproval,
+    NoopSecurityAuditor, SecurityAuditor,
+};
 
 /// Redact sensitive values for safe logging. Shows first 4 chars + "***" suffix.
 /// This function intentionally breaks the data-flow taint chain for static analysis.

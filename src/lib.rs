@@ -39,16 +39,23 @@ use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 
 pub mod agent;
+pub mod auto_reply;
 pub mod channels;
 pub mod config;
 pub mod gateway;
 pub(crate) mod health;
 pub(crate) mod identity;
+pub mod infra;
+pub mod media;
 pub mod memory;
 pub mod observability;
+pub mod plugins;
 pub mod providers;
+pub mod routing;
 pub mod runtime;
 pub(crate) mod security;
+pub mod sessions;
+pub mod skills;
 pub mod tools;
 pub(crate) mod util;
 

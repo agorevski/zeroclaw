@@ -6,7 +6,9 @@
 //! of tool execution. The agent runtime selects and applies a sandbox backend
 //! before executing any shell command.
 
+use anyhow::Result;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::process::Command;
 
 /// Sandbox backend for OS-level process isolation.
@@ -115,4 +117,74 @@ mod tests {
             original_args
         );
     }
+}
+
+// --- Extension traits for OpenClaw architecture parity ---
+
+/// Security auditor for pre-execution scanning.
+///
+/// Matches OpenClaw's security audit system that scans for attack surface
+/// exposure, plugin trust, secrets in config, and sandbox misconfigurations.
+#[async_trait]
+pub trait SecurityAuditor: Send + Sync {
+    /// Run a full security audit and return findings.
+    async fn audit(&self) -> Result<Vec<AuditFinding>>;
+    fn name(&self) -> &str;
+}
+
+/// A single finding from a security audit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditFinding {
+    pub severity: AuditSeverity,
+    pub category: String,
+    pub message: String,
+    pub recommendation: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AuditSeverity {
+    Info,
+    Warning,
+    Critical,
+}
+
+/// DM (Direct Message) access policy per channel.
+///
+/// Controls whether unknown senders can reach the agent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DmAccessPolicy {
+    Allow,
+    Block,
+    PairingRequired,
+}
+
+/// DM policy manager for per-channel access control.
+pub trait DmPolicyManager: Send + Sync {
+    /// Get the DM access policy for a specific channel.
+    fn get_policy(&self, channel: &str) -> DmAccessPolicy;
+    /// Set the DM access policy for a channel.
+    fn set_policy(&mut self, channel: &str, policy: DmAccessPolicy);
+    /// Check if a sender is allowed on a channel.
+    fn is_allowed(&self, channel: &str, sender: &str) -> bool;
+    fn name(&self) -> &str;
+}
+
+/// Execution approval system for commands requiring explicit user consent.
+#[async_trait]
+pub trait ExecApproval: Send + Sync {
+    /// Check if a command requires approval.
+    fn requires_approval(&self, command: &str) -> bool;
+    /// Request approval for a command (may block waiting for user input).
+    async fn request_approval(&self, command: &str, context: &str) -> Result<bool>;
+    fn name(&self) -> &str;
+}
+
+/// No-op security auditor that reports no findings.
+#[derive(Debug, Clone, Default)]
+pub struct NoopSecurityAuditor;
+
+#[async_trait]
+impl SecurityAuditor for NoopSecurityAuditor {
+    async fn audit(&self) -> Result<Vec<AuditFinding>> { Ok(vec![]) }
+    fn name(&self) -> &str { "noop" }
 }

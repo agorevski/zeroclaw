@@ -8,6 +8,13 @@
 //! - Header sanitization (handled by axum/hyper)
 
 pub mod api;
+pub mod traits;
+
+#[allow(unused_imports)]
+pub use traits::{
+    EventBroadcaster, Frame, FrameType, GatewayAuth, GatewayHandler, GatewayRequestContext,
+    GatewayResponse, JsonProtocol, Protocol,
+};
 
 use crate::channels::{Channel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
