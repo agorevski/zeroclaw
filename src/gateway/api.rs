@@ -57,13 +57,6 @@ pub struct MemoryStoreBody {
     pub category: Option<String>,
 }
 
-#[derive(Deserialize)]
-pub struct CronAddBody {
-    pub name: Option<String>,
-    pub schedule: String,
-    pub command: String,
-}
-
 // ── Handlers ────────────────────────────────────────────────────
 
 /// GET /api/status — system status overview
@@ -78,12 +71,6 @@ pub async fn handle_api_status(
     let config = state.config.lock().clone();
     let health = crate::health::snapshot();
 
-    let mut channels = serde_json::Map::new();
-
-    for (channel, present) in config.channels_config.channels() {
-        channels.insert(channel.name().to_string(), serde_json::Value::Bool(present));
-    }
-
     let body = serde_json::json!({
         "provider": config.default_provider,
         "model": state.model,
@@ -93,7 +80,6 @@ pub async fn handle_api_status(
         "locale": "en",
         "memory_backend": state.mem.name(),
         "paired": state.pairing.is_paired(),
-        "channels": channels,
         "health": health,
     });
 
@@ -194,162 +180,6 @@ pub async fn handle_api_tools(
     Json(serde_json::json!({"tools": tools})).into_response()
 }
 
-/// GET /api/cron — list cron jobs
-pub async fn handle_api_cron_list(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
-    let config = state.config.lock().clone();
-    match crate::cron::list_jobs(&config) {
-        Ok(jobs) => {
-            let jobs_json: Vec<serde_json::Value> = jobs
-                .iter()
-                .map(|job| {
-                    serde_json::json!({
-                        "id": job.id,
-                        "name": job.name,
-                        "command": job.command,
-                        "next_run": job.next_run.to_rfc3339(),
-                        "last_run": job.last_run.map(|t| t.to_rfc3339()),
-                        "last_status": job.last_status,
-                        "enabled": job.enabled,
-                    })
-                })
-                .collect();
-            Json(serde_json::json!({"jobs": jobs_json})).into_response()
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to list cron jobs: {e}")})),
-        )
-            .into_response(),
-    }
-}
-
-/// POST /api/cron — add a new cron job
-pub async fn handle_api_cron_add(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<CronAddBody>,
-) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
-    let config = state.config.lock().clone();
-    let schedule = crate::cron::Schedule::Cron {
-        expr: body.schedule,
-        tz: None,
-    };
-
-    match crate::cron::add_shell_job(&config, body.name, schedule, &body.command) {
-        Ok(job) => Json(serde_json::json!({
-            "status": "ok",
-            "job": {
-                "id": job.id,
-                "name": job.name,
-                "command": job.command,
-                "enabled": job.enabled,
-            }
-        }))
-        .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to add cron job: {e}")})),
-        )
-            .into_response(),
-    }
-}
-
-/// DELETE /api/cron/:id — remove a cron job
-pub async fn handle_api_cron_delete(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
-    let config = state.config.lock().clone();
-    match crate::cron::remove_job(&config, &id) {
-        Ok(()) => Json(serde_json::json!({"status": "ok"})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to remove cron job: {e}")})),
-        )
-            .into_response(),
-    }
-}
-
-/// GET /api/integrations — list all integrations with status
-pub async fn handle_api_integrations(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
-    let config = state.config.lock().clone();
-    let entries = crate::integrations::registry::all_integrations();
-
-    let integrations: Vec<serde_json::Value> = entries
-        .iter()
-        .map(|entry| {
-            let status = (entry.status_fn)(&config);
-            serde_json::json!({
-                "name": entry.name,
-                "description": entry.description,
-                "category": entry.category,
-                "status": status,
-            })
-        })
-        .collect();
-
-    Json(serde_json::json!({"integrations": integrations})).into_response()
-}
-
-/// POST /api/doctor — run diagnostics
-pub async fn handle_api_doctor(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
-    let config = state.config.lock().clone();
-    let results = crate::doctor::diagnose(&config);
-
-    let ok_count = results
-        .iter()
-        .filter(|r| r.severity == crate::doctor::Severity::Ok)
-        .count();
-    let warn_count = results
-        .iter()
-        .filter(|r| r.severity == crate::doctor::Severity::Warn)
-        .count();
-    let error_count = results
-        .iter()
-        .filter(|r| r.severity == crate::doctor::Severity::Error)
-        .count();
-
-    Json(serde_json::json!({
-        "results": results,
-        "summary": {
-            "ok": ok_count,
-            "warnings": warn_count,
-            "errors": error_count,
-        }
-    }))
-    .into_response()
-}
-
 /// GET /api/memory — list or search memory entries
 pub async fn handle_api_memory_list(
     State(state): State<AppState>,
@@ -447,39 +277,6 @@ pub async fn handle_api_memory_delete(
     }
 }
 
-/// GET /api/cost — cost summary
-pub async fn handle_api_cost(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
-    if let Some(ref tracker) = state.cost_tracker {
-        match tracker.get_summary() {
-            Ok(summary) => Json(serde_json::json!({"cost": summary})).into_response(),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Cost summary failed: {e}")})),
-            )
-                .into_response(),
-        }
-    } else {
-        Json(serde_json::json!({
-            "cost": {
-                "session_cost_usd": 0.0,
-                "daily_cost_usd": 0.0,
-                "monthly_cost_usd": 0.0,
-                "total_tokens": 0,
-                "request_count": 0,
-                "by_model": {},
-            }
-        }))
-        .into_response()
-    }
-}
-
 /// GET /api/cli-tools — discovered CLI tools
 pub async fn handle_api_cli_tools(
     State(state): State<AppState>,
@@ -489,7 +286,7 @@ pub async fn handle_api_cli_tools(
         return e.into_response();
     }
 
-    let tools = crate::tools::cli_discovery::discover_cli_tools(&[], &[]);
+    let tools: Vec<String> = vec![];
 
     Json(serde_json::json!({"cli_tools": tools})).into_response()
 }
@@ -521,7 +318,7 @@ fn mask_sensitive_fields(toml_str: &str) -> String {
             || trimmed.starts_with("signing_secret")
         {
             if let Some(eq_pos) = line.find('=') {
-                output.push_str(&line[..eq_pos + 1]);
+                output.push_str(&line[..=eq_pos]);
                 output.push_str(" \"***MASKED***\"");
             } else {
                 output.push_str(line);

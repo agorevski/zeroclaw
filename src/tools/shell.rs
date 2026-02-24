@@ -11,6 +11,20 @@ use std::time::Duration;
 const SHELL_TIMEOUT_SECS: u64 = 60;
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
+
+/// Find the largest byte index <= `index` that is a valid UTF-8 char boundary.
+/// Equivalent to `str::floor_char_boundary` (stabilized in Rust 1.91) but
+/// compatible with the project MSRV (1.87).
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    let mut i = index;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
 /// Environment variables safe to pass to shell commands.
 /// Only functional variables are included — never API keys or secrets.
 const SAFE_ENV_VARS: &[&str] = &[
@@ -164,11 +178,11 @@ impl Tool for ShellTool {
 
                 // Truncate output to prevent OOM
                 if stdout.len() > MAX_OUTPUT_BYTES {
-                    stdout.truncate(stdout.floor_char_boundary(MAX_OUTPUT_BYTES));
+                    stdout.truncate(floor_char_boundary(&stdout, MAX_OUTPUT_BYTES));
                     stdout.push_str("\n... [output truncated at 1MB]");
                 }
                 if stderr.len() > MAX_OUTPUT_BYTES {
-                    stderr.truncate(stderr.floor_char_boundary(MAX_OUTPUT_BYTES));
+                    stderr.truncate(floor_char_boundary(&stderr, MAX_OUTPUT_BYTES));
                     stderr.push_str("\n... [stderr truncated at 1MB]");
                 }
 

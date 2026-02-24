@@ -4,7 +4,16 @@
 //! portable AI identity. This module handles loading and converting AIEOS v1.1
 //! JSON to ZeroClaw's system prompt format.
 
-use crate::config::IdentityConfig;
+/// Identity configuration (defined locally after config strip).
+#[derive(Debug, Clone, Default)]
+pub struct IdentityConfig {
+    /// Format: "openclaw" (markdown) or "aieos" (JSON)
+    pub format: String,
+    /// Path to an AIEOS JSON file (relative to workspace)
+    pub aieos_path: Option<String>,
+    /// Inline AIEOS JSON string
+    pub aieos_inline: Option<String>,
+}
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};

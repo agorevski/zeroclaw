@@ -20,7 +20,7 @@ use zeroclaw::memory::Memory;
 use zeroclaw::observability::{NoopObserver, Observer};
 use zeroclaw::providers::traits::ChatMessage;
 use zeroclaw::providers::{
-    ChatRequest, ChatResponse, ConversationMessage, Provider, ProviderRuntimeOptions, ToolCall,
+    ChatRequest, ChatResponse, ConversationMessage, Provider, ToolCall,
 };
 use zeroclaw::tools::{Tool, ToolResult};
 
@@ -656,19 +656,19 @@ async fn e2e_empty_memory_context_passthrough() {
 // Live integration test — real OpenAI Codex API (requires credentials)
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Sends a real multi-turn conversation to OpenAI Codex and verifies
+/// Sends a real multi-turn conversation to OpenAI and verifies
 /// the model retains context from earlier messages.
 ///
-/// Requires valid OAuth credentials in `~/.zeroclaw/`.
-/// Run manually: `cargo test e2e_live_openai_codex_multi_turn -- --ignored`
+/// Requires valid credentials.
+/// Run manually: `cargo test e2e_live_openai_multi_turn -- --ignored`
 #[tokio::test]
 #[ignore]
-async fn e2e_live_openai_codex_multi_turn() {
-    use zeroclaw::providers::openai_codex::OpenAiCodexProvider;
+async fn e2e_live_openai_multi_turn() {
+    use zeroclaw::providers::openai::OpenAiProvider;
     use zeroclaw::providers::traits::Provider;
 
-    let provider = OpenAiCodexProvider::new(&ProviderRuntimeOptions::default());
-    let model = "gpt-5.3-codex";
+    let provider = OpenAiProvider::with_base_url(None, None);
+    let model = "gpt-4o-mini";
 
     // Turn 1: establish a fact
     let messages_turn1 = vec![

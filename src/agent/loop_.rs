@@ -1,10 +1,8 @@
-use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
-use crate::multimodal;
 use crate::observability::{self, runtime_trace, Observer, ObserverEvent};
 use crate::providers::{
-    self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
+    self, ChatMessage, ChatRequest, Provider, ToolCall,
 };
 use crate::runtime;
 use crate::security::SecurityPolicy;
@@ -271,45 +269,7 @@ async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f6
     context
 }
 
-/// Build hardware datasheet context from RAG when peripherals are enabled.
-/// Includes pin-alias lookup (e.g. "red_led" → 13) when query matches, plus retrieved chunks.
-fn build_hardware_context(
-    rag: &crate::rag::HardwareRag,
-    user_msg: &str,
-    boards: &[String],
-    chunk_limit: usize,
-) -> String {
-    if rag.is_empty() || boards.is_empty() {
-        return String::new();
-    }
 
-    let mut context = String::new();
-
-    // Pin aliases: when user says "red led", inject "red_led: 13" for matching boards
-    let pin_ctx = rag.pin_alias_context(user_msg, boards);
-    if !pin_ctx.is_empty() {
-        context.push_str(&pin_ctx);
-    }
-
-    let chunks = rag.retrieve(user_msg, boards, chunk_limit);
-    if chunks.is_empty() && pin_ctx.is_empty() {
-        return String::new();
-    }
-
-    if !chunks.is_empty() {
-        context.push_str("[Hardware documentation]\n");
-    }
-    for chunk in chunks {
-        let board_tag = chunk.board.as_deref().unwrap_or("generic");
-        let _ = writeln!(
-            context,
-            "--- {} ({}) ---\n{}\n",
-            chunk.source, board_tag, chunk.content
-        );
-    }
-    context.push('\n');
-    context
-}
 
 /// Find a tool by name in the registry.
 fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
@@ -387,7 +347,7 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
             return Some(ParsedToolCall {
                 name,
                 arguments,
-                tool_call_id: tool_call_id,
+                tool_call_id,
             });
         }
     }
@@ -409,7 +369,7 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
     Some(ParsedToolCall {
         name,
         arguments,
-        tool_call_id: tool_call_id,
+        tool_call_id,
     })
 }
 
@@ -1799,7 +1759,6 @@ pub(crate) async fn agent_turn(
     model: &str,
     temperature: f64,
     silent: bool,
-    multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
 ) -> Result<String> {
     run_tool_call_loop(
@@ -1811,11 +1770,8 @@ pub(crate) async fn agent_turn(
         model,
         temperature,
         silent,
-        None,
         "channel",
-        multimodal_config,
         max_tool_iterations,
-        None,
         None,
         None,
         &[],
@@ -1913,18 +1869,9 @@ struct ToolExecutionOutcome {
 
 fn should_execute_tools_in_parallel(
     tool_calls: &[ParsedToolCall],
-    approval: Option<&ApprovalManager>,
 ) -> bool {
     if tool_calls.len() <= 1 {
         return false;
-    }
-
-    if let Some(mgr) = approval {
-        if tool_calls.iter().any(|call| mgr.needs_approval(&call.name)) {
-            // Approval-gated calls must keep sequential handling so the caller can
-            // enforce CLI prompt/deny policy consistently.
-            return false;
-        }
     }
 
     true
@@ -2001,13 +1948,10 @@ pub(crate) async fn run_tool_call_loop(
     model: &str,
     temperature: f64,
     silent: bool,
-    approval: Option<&ApprovalManager>,
     channel_name: &str,
-    multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
-    hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
@@ -2032,21 +1976,6 @@ pub(crate) async fn run_tool_call_loop(
         {
             return Err(ToolLoopCancelled.into());
         }
-
-        let image_marker_count = multimodal::count_image_markers(history);
-        if image_marker_count > 0 && !provider.supports_vision() {
-            return Err(ProviderCapabilityError {
-                provider: provider_name.to_string(),
-                capability: "vision".to_string(),
-                message: format!(
-                    "received {image_marker_count} image marker(s), but this provider does not support vision input"
-                ),
-            }
-            .into());
-        }
-
-        let prepared_messages =
-            multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
 
         // ── Progress: LLM thinking ────────────────────────────
         if let Some(ref tx) = on_delta {
@@ -2079,11 +2008,6 @@ pub(crate) async fn run_tool_call_loop(
 
         let llm_started_at = Instant::now();
 
-        // Fire void hook before LLM call
-        if let Some(hooks) = hooks {
-            hooks.fire_llm_input(history, model).await;
-        }
-
         // Unified path via Provider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
         let request_tools = if use_native_tools {
@@ -2094,7 +2018,7 @@ pub(crate) async fn run_tool_call_loop(
 
         let chat_future = provider.chat(
             ChatRequest {
-                messages: &prepared_messages.messages,
+                messages: history,
                 tools: request_tools,
             },
             model,
@@ -2322,102 +2246,13 @@ pub(crate) async fn run_tool_call_loop(
         let mut individual_results: Vec<(Option<String>, String)> = Vec::new();
         let mut ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>> =
             (0..tool_calls.len()).map(|_| None).collect();
-        let allow_parallel_execution = should_execute_tools_in_parallel(&tool_calls, approval);
+        let allow_parallel_execution = should_execute_tools_in_parallel(&tool_calls);
         let mut executable_indices: Vec<usize> = Vec::new();
         let mut executable_calls: Vec<ParsedToolCall> = Vec::new();
 
         for (idx, call) in tool_calls.iter().enumerate() {
-            // ── Hook: before_tool_call (modifying) ──────────
-            let mut tool_name = call.name.clone();
-            let mut tool_args = call.arguments.clone();
-            if let Some(hooks) = hooks {
-                match hooks
-                    .run_before_tool_call(tool_name.clone(), tool_args.clone())
-                    .await
-                {
-                    crate::hooks::HookResult::Cancel(reason) => {
-                        tracing::info!(tool = %call.name, %reason, "tool call cancelled by hook");
-                        let cancelled = format!("Cancelled by hook: {reason}");
-                        runtime_trace::record_event(
-                            "tool_call_result",
-                            Some(channel_name),
-                            Some(provider_name),
-                            Some(model),
-                            Some(&turn_id),
-                            Some(false),
-                            Some(&cancelled),
-                            serde_json::json!({
-                                "iteration": iteration + 1,
-                                "tool": call.name,
-                                "arguments": scrub_credentials(&tool_args.to_string()),
-                            }),
-                        );
-                        ordered_results[idx] = Some((
-                            call.name.clone(),
-                            call.tool_call_id.clone(),
-                            ToolExecutionOutcome {
-                                output: cancelled,
-                                success: false,
-                                error_reason: Some(scrub_credentials(&reason)),
-                                duration: Duration::ZERO,
-                            },
-                        ));
-                        continue;
-                    }
-                    crate::hooks::HookResult::Continue((name, args)) => {
-                        tool_name = name;
-                        tool_args = args;
-                    }
-                }
-            }
-
-            // ── Approval hook ────────────────────────────────
-            if let Some(mgr) = approval {
-                if mgr.needs_approval(&tool_name) {
-                    let request = ApprovalRequest {
-                        tool_name: tool_name.clone(),
-                        arguments: tool_args.clone(),
-                    };
-
-                    // Only prompt interactively on CLI; auto-approve on other channels.
-                    let decision = if channel_name == "cli" {
-                        mgr.prompt_cli(&request)
-                    } else {
-                        ApprovalResponse::Yes
-                    };
-
-                    mgr.record_decision(&tool_name, &tool_args, decision, channel_name);
-
-                    if decision == ApprovalResponse::No {
-                        let denied = "Denied by user.".to_string();
-                        runtime_trace::record_event(
-                            "tool_call_result",
-                            Some(channel_name),
-                            Some(provider_name),
-                            Some(model),
-                            Some(&turn_id),
-                            Some(false),
-                            Some(&denied),
-                            serde_json::json!({
-                                "iteration": iteration + 1,
-                                "tool": tool_name.clone(),
-                                "arguments": scrub_credentials(&tool_args.to_string()),
-                            }),
-                        );
-                        ordered_results[idx] = Some((
-                            tool_name.clone(),
-                            call.tool_call_id.clone(),
-                            ToolExecutionOutcome {
-                                output: denied.clone(),
-                                success: false,
-                                error_reason: Some(denied),
-                                duration: Duration::ZERO,
-                            },
-                        ));
-                        continue;
-                    }
-                }
-            }
+            let tool_name = call.name.clone();
+            let tool_args = call.arguments.clone();
 
             let signature = tool_call_signature(&tool_name, &tool_args);
             if !seen_tool_signatures.insert(signature) {
@@ -2526,18 +2361,6 @@ pub(crate) async fn run_tool_call_loop(
                 }),
             );
 
-            // ── Hook: after_tool_call (void) ─────────────────
-            if let Some(hooks) = hooks {
-                let tool_result_obj = crate::tools::ToolResult {
-                    success: outcome.success,
-                    output: outcome.output.clone(),
-                    error: None,
-                };
-                hooks
-                    .fire_after_tool_call(&call.name, &tool_result_obj, outcome.duration)
-                    .await;
-            }
-
             // ── Progress: tool completion ───────────────────────
             if let Some(ref tx) = on_delta {
                 let secs = outcome.duration.as_secs();
@@ -2553,15 +2376,13 @@ pub(crate) async fn run_tool_call_loop(
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
         }
 
-        for entry in ordered_results {
-            if let Some((tool_name, tool_call_id, outcome)) = entry {
-                individual_results.push((tool_call_id, outcome.output.clone()));
-                let _ = writeln!(
-                    tool_results,
-                    "<tool_result name=\"{}\">\n{}\n</tool_result>",
-                    tool_name, outcome.output
-                );
-            }
+        for (tool_name, tool_call_id, outcome) in ordered_results.into_iter().flatten() {
+            individual_results.push((tool_call_id, outcome.output.clone()));
+            let _ = writeln!(
+                tool_results,
+                "<tool_result name=\"{}\">\n{}\n</tool_result>",
+                tool_name, outcome.output
+            );
         }
 
         // Add assistant message with tool calls + tool results to history.
@@ -2657,8 +2478,6 @@ pub async fn run(
     provider_override: Option<String>,
     model_override: Option<String>,
     temperature: f64,
-    peripheral_overrides: Vec<String>,
-    interactive: bool,
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
@@ -2673,61 +2492,29 @@ pub async fn run(
     // ── Memory (the brain) ────────────────────────────────────────
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
         &config.memory,
-        Some(&config.storage.provider.config),
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
     tracing::info!(backend = mem.name(), "Memory initialized");
 
-    // ── Peripherals (merge peripheral tools into registry) ─
-    if !peripheral_overrides.is_empty() {
-        tracing::info!(
-            peripherals = ?peripheral_overrides,
-            "Peripheral overrides from CLI (config boards take precedence)"
-        );
-    }
-
-    // ── Tools (including memory tools and peripherals) ────────────
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
-        (
-            config.composio.api_key.as_deref(),
-            Some(config.composio.entity_id.as_str()),
-        )
-    } else {
-        (None, None)
-    };
-    let mut tools_registry = tools::all_tools_with_runtime(
+    // ── Tools ────────────────────────────────────────────────────
+    let tools_registry = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
         mem.clone(),
-        composio_key,
-        composio_entity_id,
-        &config.browser,
-        &config.http_request,
-        &config.workspace_dir,
-        &config.agents,
-        config.api_key.as_deref(),
-        &config,
     );
-
-    let peripheral_tools: Vec<Box<dyn Tool>> =
-        crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
-    if !peripheral_tools.is_empty() {
-        tracing::info!(count = peripheral_tools.len(), "Peripheral tools added");
-        tools_registry.extend(peripheral_tools);
-    }
 
     // ── Resolve provider ─────────────────────────────────────────
     let provider_name = provider_override
         .as_deref()
         .or(config.default_provider.as_deref())
-        .unwrap_or("openrouter");
+        .unwrap_or("openai");
 
     let model_name = model_override
         .as_deref()
         .or(config.default_model.as_deref())
-        .unwrap_or("anthropic/claude-sonnet-4");
+        .unwrap_or("gpt-4o");
 
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
@@ -2740,9 +2527,6 @@ pub async fn run(
         provider_name,
         config.api_key.as_deref(),
         config.api_url.as_deref(),
-        &config.reliability,
-        &config.model_routes,
-        model_name,
         &provider_runtime_options,
     )?;
 
@@ -2751,29 +2535,8 @@ pub async fn run(
         model: model_name.to_string(),
     });
 
-    // ── Hardware RAG (datasheet retrieval when peripherals + datasheet_dir) ──
-    let hardware_rag: Option<crate::rag::HardwareRag> = config
-        .peripherals
-        .datasheet_dir
-        .as_ref()
-        .filter(|d| !d.trim().is_empty())
-        .map(|dir| crate::rag::HardwareRag::load(&config.workspace_dir, dir.trim()))
-        .and_then(Result::ok)
-        .filter(|r: &crate::rag::HardwareRag| !r.is_empty());
-    if let Some(ref rag) = hardware_rag {
-        tracing::info!(chunks = rag.len(), "Hardware RAG loaded");
-    }
-
-    let board_names: Vec<String> = config
-        .peripherals
-        .boards
-        .iter()
-        .map(|b| b.board.clone())
-        .collect();
-
-    // ── Build system prompt from workspace MD files (OpenClaw framework) ──
-    let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
-    let mut tool_descs: Vec<(&str, &str)> = vec![
+    // ── Build system prompt from workspace MD files ──────────────
+    let tool_descs: Vec<(&str, &str)> = vec![
         (
             "shell",
             "Execute terminal commands. Use when: running local checks, build/test commands, diagnostics. Don't use when: a safer dedicated tool exists, or command is destructive without approval.",
@@ -2794,93 +2557,7 @@ pub async fn run(
             "memory_recall",
             "Search memory. Use when: retrieving prior decisions, user preferences, historical context. Don't use when: answer is already in current context.",
         ),
-        (
-            "memory_forget",
-            "Delete a memory entry. Use when: memory is incorrect/stale or explicitly requested for removal. Don't use when: impact is uncertain.",
-        ),
     ];
-    tool_descs.push((
-        "cron_add",
-        "Create a cron job. Supports schedule kinds: cron, at, every; and job types: shell or agent.",
-    ));
-    tool_descs.push((
-        "cron_list",
-        "List all cron jobs with schedule, status, and metadata.",
-    ));
-    tool_descs.push(("cron_remove", "Remove a cron job by job_id."));
-    tool_descs.push((
-        "cron_update",
-        "Patch a cron job (schedule, enabled, command/prompt, model, delivery, session_target).",
-    ));
-    tool_descs.push((
-        "cron_run",
-        "Force-run a cron job immediately and record a run history entry.",
-    ));
-    tool_descs.push(("cron_runs", "Show recent run history for a cron job."));
-    tool_descs.push((
-        "screenshot",
-        "Capture a screenshot of the current screen. Returns file path and base64-encoded PNG. Use when: visual verification, UI inspection, debugging displays.",
-    ));
-    tool_descs.push((
-        "image_info",
-        "Read image file metadata (format, dimensions, size) and optionally base64-encode it. Use when: inspecting images, preparing visual data for analysis.",
-    ));
-    if config.browser.enabled {
-        tool_descs.push((
-            "browser_open",
-            "Open approved HTTPS URLs in Brave Browser (allowlist-only, no scraping)",
-        ));
-    }
-    if config.composio.enabled {
-        tool_descs.push((
-            "composio",
-            "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run (optionally with connected_account_id), 'connect' to OAuth.",
-        ));
-    }
-    tool_descs.push((
-        "schedule",
-        "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
-    ));
-    tool_descs.push((
-        "model_routing_config",
-        "Configure default model, scenario routing, and delegate agents. Use for natural-language requests like: 'set conversation to kimi and coding to gpt-5.3-codex'.",
-    ));
-    if !config.agents.is_empty() {
-        tool_descs.push((
-            "delegate",
-            "Delegate a sub-task to a specialized agent. Use when: task needs different model/capability, or to parallelize work.",
-        ));
-    }
-    if config.peripherals.enabled && !config.peripherals.boards.is_empty() {
-        tool_descs.push((
-            "gpio_read",
-            "Read GPIO pin value (0 or 1) on connected hardware (STM32, Arduino). Use when: checking sensor/button state, LED status.",
-        ));
-        tool_descs.push((
-            "gpio_write",
-            "Set GPIO pin high (1) or low (0) on connected hardware. Use when: turning LED on/off, controlling actuators.",
-        ));
-        tool_descs.push((
-            "arduino_upload",
-            "Upload agent-generated Arduino sketch. Use when: user asks for 'make a heart', 'blink pattern', or custom LED behavior on Arduino. You write the full .ino code; ZeroClaw compiles and uploads it. Pin 13 = built-in LED on Uno.",
-        ));
-        tool_descs.push((
-            "hardware_memory_map",
-            "Return flash and RAM address ranges for connected hardware. Use when: user asks for 'upper and lower memory addresses', 'memory map', or 'readable addresses'.",
-        ));
-        tool_descs.push((
-            "hardware_board_info",
-            "Return full board info (chip, architecture, memory map) for connected hardware. Use when: user asks for 'board info', 'what board do I have', 'connected hardware', 'chip info', or 'what hardware'.",
-        ));
-        tool_descs.push((
-            "hardware_memory_read",
-            "Read actual memory/register values from Nucleo via USB. Use when: user asks to 'read register values', 'read memory', 'dump lower memory 0-126', 'give address and value'. Params: address (hex, default 0x20000000), length (bytes, default 128).",
-        ));
-        tool_descs.push((
-            "hardware_capabilities",
-            "Query connected hardware for reported GPIO pins and LED pin. Use when: user asks what pins are available.",
-        ));
-    }
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
@@ -2891,11 +2568,8 @@ pub async fn run(
         &config.workspace_dir,
         model_name,
         &tool_descs,
-        &skills,
-        Some(&config.identity),
         bootstrap_max_chars,
         native_tools,
-        config.skills.prompt_injection_mode,
     );
 
     // Append structured tool-use instructions with schemas (only for non-native providers)
@@ -2903,13 +2577,7 @@ pub async fn run(
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
 
-    // ── Approval manager (supervised mode) ───────────────────────
-    let approval_manager = if interactive {
-        Some(ApprovalManager::from_config(&config.autonomy))
-    } else {
-        None
-    };
-    let channel_name = if interactive { "cli" } else { "daemon" };
+    let channel_name = "daemon";
 
     // ── Execute ──────────────────────────────────────────────────
     let start = Instant::now();
@@ -2925,15 +2593,10 @@ pub async fn run(
                 .await;
         }
 
-        // Inject memory + hardware RAG context into user message
+        // Inject memory context into user message
         let mem_context =
             build_context(mem.as_ref(), &msg, config.memory.min_relevance_score).await;
-        let rag_limit = if config.agent.compact_context { 2 } else { 5 };
-        let hw_context = hardware_rag
-            .as_ref()
-            .map(|r| build_hardware_context(r, &msg, &board_names, rag_limit))
-            .unwrap_or_default();
-        let context = format!("{mem_context}{hw_context}");
+        let context = mem_context;
         let enriched = if context.is_empty() {
             msg.clone()
         } else {
@@ -2954,11 +2617,8 @@ pub async fn run(
             model_name,
             temperature,
             false,
-            approval_manager.as_ref(),
             channel_name,
-            &config.multimodal,
             config.agent.max_tool_iterations,
-            None,
             None,
             None,
             &[],
@@ -2967,159 +2627,6 @@ pub async fn run(
         final_output = response.clone();
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
-    } else {
-        println!("🦀 ZeroClaw Interactive Mode");
-        println!("Type /help for commands.\n");
-        let cli = crate::channels::CliChannel::new();
-
-        // Persistent conversation history across turns
-        let mut history = vec![ChatMessage::system(&system_prompt)];
-
-        loop {
-            print!("> ");
-            let _ = std::io::stdout().flush();
-
-            let mut input = String::new();
-            match std::io::stdin().read_line(&mut input) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("\nError reading input: {e}\n");
-                    break;
-                }
-            }
-
-            let user_input = input.trim().to_string();
-            if user_input.is_empty() {
-                continue;
-            }
-            match user_input.as_str() {
-                "/quit" | "/exit" => break,
-                "/help" => {
-                    println!("Available commands:");
-                    println!("  /help        Show this help message");
-                    println!("  /clear /new  Clear conversation history");
-                    println!("  /quit /exit  Exit interactive mode\n");
-                    continue;
-                }
-                "/clear" | "/new" => {
-                    println!(
-                        "This will clear the current conversation and delete all session memory."
-                    );
-                    println!("Core memories (long-term facts/preferences) will be preserved.");
-                    print!("Continue? [y/N] ");
-                    let _ = std::io::stdout().flush();
-
-                    let mut confirm = String::new();
-                    if std::io::stdin().read_line(&mut confirm).is_err() {
-                        continue;
-                    }
-                    if !matches!(confirm.trim().to_lowercase().as_str(), "y" | "yes") {
-                        println!("Cancelled.\n");
-                        continue;
-                    }
-
-                    history.clear();
-                    history.push(ChatMessage::system(&system_prompt));
-                    // Clear conversation and daily memory
-                    let mut cleared = 0;
-                    for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
-                        let entries = mem.list(Some(&category), None).await.unwrap_or_default();
-                        for entry in entries {
-                            if mem.forget(&entry.key).await.unwrap_or(false) {
-                                cleared += 1;
-                            }
-                        }
-                    }
-                    if cleared > 0 {
-                        println!("Conversation cleared ({cleared} memory entries removed).\n");
-                    } else {
-                        println!("Conversation cleared.\n");
-                    }
-                    continue;
-                }
-                _ => {}
-            }
-
-            // Auto-save conversation turns (skip short/trivial messages)
-            if config.memory.auto_save && user_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
-                let user_key = autosave_memory_key("user_msg");
-                let _ = mem
-                    .store(&user_key, &user_input, MemoryCategory::Conversation, None)
-                    .await;
-            }
-
-            // Inject memory + hardware RAG context into user message
-            let mem_context =
-                build_context(mem.as_ref(), &user_input, config.memory.min_relevance_score).await;
-            let rag_limit = if config.agent.compact_context { 2 } else { 5 };
-            let hw_context = hardware_rag
-                .as_ref()
-                .map(|r| build_hardware_context(r, &user_input, &board_names, rag_limit))
-                .unwrap_or_default();
-            let context = format!("{mem_context}{hw_context}");
-            let enriched = if context.is_empty() {
-                user_input.clone()
-            } else {
-                format!("{context}{user_input}")
-            };
-
-            history.push(ChatMessage::user(&enriched));
-
-            let response = match run_tool_call_loop(
-                provider.as_ref(),
-                &mut history,
-                &tools_registry,
-                observer.as_ref(),
-                provider_name,
-                model_name,
-                temperature,
-                false,
-                approval_manager.as_ref(),
-                channel_name,
-                &config.multimodal,
-                config.agent.max_tool_iterations,
-                None,
-                None,
-                None,
-                &[],
-            )
-            .await
-            {
-                Ok(resp) => resp,
-                Err(e) => {
-                    eprintln!("\nError: {e}\n");
-                    continue;
-                }
-            };
-            final_output = response.clone();
-            if let Err(e) = crate::channels::Channel::send(
-                &cli,
-                &crate::channels::traits::SendMessage::new(format!("\n{response}\n"), "user"),
-            )
-            .await
-            {
-                eprintln!("\nError sending CLI response: {e}\n");
-            }
-            observer.record_event(&ObserverEvent::TurnComplete);
-
-            // Auto-compaction before hard trimming to preserve long-context signal.
-            if let Ok(compacted) = auto_compact_history(
-                &mut history,
-                provider.as_ref(),
-                model_name,
-                config.agent.max_history_messages,
-            )
-            .await
-            {
-                if compacted {
-                    println!("🧹 Auto-compaction complete");
-                }
-            }
-
-            // Hard cap as a safety net.
-            trim_history(&mut history, config.agent.max_history_messages);
-        }
     }
 
     let duration = start.elapsed();
@@ -3147,42 +2654,22 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     ));
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
         &config.memory,
-        Some(&config.storage.provider.config),
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
 
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
-        (
-            config.composio.api_key.as_deref(),
-            Some(config.composio.entity_id.as_str()),
-        )
-    } else {
-        (None, None)
-    };
-    let mut tools_registry = tools::all_tools_with_runtime(
+    let tools_registry = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
         mem.clone(),
-        composio_key,
-        composio_entity_id,
-        &config.browser,
-        &config.http_request,
-        &config.workspace_dir,
-        &config.agents,
-        config.api_key.as_deref(),
-        &config,
     );
-    let peripheral_tools: Vec<Box<dyn Tool>> =
-        crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
-    tools_registry.extend(peripheral_tools);
 
-    let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
+    let provider_name = config.default_provider.as_deref().unwrap_or("openai");
     let model_name = config
         .default_model
         .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
+        .unwrap_or_else(|| "gpt-4o".into());
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
@@ -3193,75 +2680,16 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         provider_name,
         config.api_key.as_deref(),
         config.api_url.as_deref(),
-        &config.reliability,
-        &config.model_routes,
-        &model_name,
         &provider_runtime_options,
     )?;
 
-    let hardware_rag: Option<crate::rag::HardwareRag> = config
-        .peripherals
-        .datasheet_dir
-        .as_ref()
-        .filter(|d| !d.trim().is_empty())
-        .map(|dir| crate::rag::HardwareRag::load(&config.workspace_dir, dir.trim()))
-        .and_then(Result::ok)
-        .filter(|r: &crate::rag::HardwareRag| !r.is_empty());
-    let board_names: Vec<String> = config
-        .peripherals
-        .boards
-        .iter()
-        .map(|b| b.board.clone())
-        .collect();
-
-    let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
-    let mut tool_descs: Vec<(&str, &str)> = vec![
+    let tool_descs: Vec<(&str, &str)> = vec![
         ("shell", "Execute terminal commands."),
         ("file_read", "Read file contents."),
         ("file_write", "Write file contents."),
         ("memory_store", "Save to memory."),
         ("memory_recall", "Search memory."),
-        ("memory_forget", "Delete a memory entry."),
-        (
-            "model_routing_config",
-            "Configure default model, scenario routing, and delegate agents.",
-        ),
-        ("screenshot", "Capture a screenshot."),
-        ("image_info", "Read image metadata."),
     ];
-    if config.browser.enabled {
-        tool_descs.push(("browser_open", "Open approved URLs in browser."));
-    }
-    if config.composio.enabled {
-        tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
-    }
-    if config.peripherals.enabled && !config.peripherals.boards.is_empty() {
-        tool_descs.push(("gpio_read", "Read GPIO pin value on connected hardware."));
-        tool_descs.push((
-            "gpio_write",
-            "Set GPIO pin high or low on connected hardware.",
-        ));
-        tool_descs.push((
-            "arduino_upload",
-            "Upload Arduino sketch. Use for 'make a heart', custom patterns. You write full .ino code; ZeroClaw uploads it.",
-        ));
-        tool_descs.push((
-            "hardware_memory_map",
-            "Return flash and RAM address ranges. Use when user asks for memory addresses or memory map.",
-        ));
-        tool_descs.push((
-            "hardware_board_info",
-            "Return full board info (chip, architecture, memory map). Use when user asks for board info, what board, connected hardware, or chip info.",
-        ));
-        tool_descs.push((
-            "hardware_memory_read",
-            "Read actual memory/register values from Nucleo. Use when user asks to read registers, read memory, dump lower memory 0-126, or give address and value.",
-        ));
-        tool_descs.push((
-            "hardware_capabilities",
-            "Query connected hardware for reported GPIO pins and LED pin. Use when user asks what pins are available.",
-        ));
-    }
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
@@ -3272,23 +2700,15 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &config.workspace_dir,
         &model_name,
         &tool_descs,
-        &skills,
-        Some(&config.identity),
         bootstrap_max_chars,
         native_tools,
-        config.skills.prompt_injection_mode,
     );
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
 
     let mem_context = build_context(mem.as_ref(), message, config.memory.min_relevance_score).await;
-    let rag_limit = if config.agent.compact_context { 2 } else { 5 };
-    let hw_context = hardware_rag
-        .as_ref()
-        .map(|r| build_hardware_context(r, message, &board_names, rag_limit))
-        .unwrap_or_default();
-    let context = format!("{mem_context}{hw_context}");
+    let context = mem_context;
     let enriched = if context.is_empty() {
         message.to_string()
     } else {
@@ -3309,7 +2729,6 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &model_name,
         config.default_temperature,
         true,
-        &config.multimodal,
         config.agent.max_tool_iterations,
     )
     .await
@@ -3318,12 +2737,9 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
-    use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use crate::memory::{Memory, MemoryCategory, SqliteMemory};
+    use std::sync::Arc;
+    use tempfile::TempDir;
 
     #[test]
     fn test_scrub_credentials() {
@@ -3342,643 +2758,6 @@ mod tests {
         let scrubbed = scrub_credentials(input);
         assert!(scrubbed.contains("\"api_key\": \"sk-1*[REDACTED]\""));
         assert!(scrubbed.contains("public"));
-    }
-    use crate::memory::{Memory, MemoryCategory, SqliteMemory};
-    use crate::observability::NoopObserver;
-    use crate::providers::traits::ProviderCapabilities;
-    use crate::providers::ChatResponse;
-    use tempfile::TempDir;
-
-    struct NonVisionProvider {
-        calls: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl Provider for NonVisionProvider {
-        async fn chat_with_system(
-            &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: f64,
-        ) -> anyhow::Result<String> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok("ok".to_string())
-        }
-    }
-
-    struct VisionProvider {
-        calls: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl Provider for VisionProvider {
-        fn capabilities(&self) -> ProviderCapabilities {
-            ProviderCapabilities {
-                native_tool_calling: false,
-                vision: true,
-            }
-        }
-
-        async fn chat_with_system(
-            &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: f64,
-        ) -> anyhow::Result<String> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok("ok".to_string())
-        }
-
-        async fn chat(
-            &self,
-            request: ChatRequest<'_>,
-            _model: &str,
-            _temperature: f64,
-        ) -> anyhow::Result<ChatResponse> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            let marker_count = crate::multimodal::count_image_markers(request.messages);
-            if marker_count == 0 {
-                anyhow::bail!("expected image markers in request messages");
-            }
-
-            if request.tools.is_some() {
-                anyhow::bail!("no tools should be attached for this test");
-            }
-
-            Ok(ChatResponse {
-                text: Some("vision-ok".to_string()),
-                tool_calls: Vec::new(),
-                usage: None,
-                reasoning_content: None,
-            })
-        }
-    }
-
-    struct ScriptedProvider {
-        responses: Arc<Mutex<VecDeque<ChatResponse>>>,
-        capabilities: ProviderCapabilities,
-    }
-
-    impl ScriptedProvider {
-        fn from_text_responses(responses: Vec<&str>) -> Self {
-            let scripted = responses
-                .into_iter()
-                .map(|text| ChatResponse {
-                    text: Some(text.to_string()),
-                    tool_calls: Vec::new(),
-                    usage: None,
-                    reasoning_content: None,
-                })
-                .collect();
-            Self {
-                responses: Arc::new(Mutex::new(scripted)),
-                capabilities: ProviderCapabilities::default(),
-            }
-        }
-
-        fn with_native_tool_support(mut self) -> Self {
-            self.capabilities.native_tool_calling = true;
-            self
-        }
-    }
-
-    #[async_trait]
-    impl Provider for ScriptedProvider {
-        fn capabilities(&self) -> ProviderCapabilities {
-            self.capabilities.clone()
-        }
-
-        async fn chat_with_system(
-            &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: f64,
-        ) -> anyhow::Result<String> {
-            anyhow::bail!("chat_with_system should not be used in scripted provider tests");
-        }
-
-        async fn chat(
-            &self,
-            _request: ChatRequest<'_>,
-            _model: &str,
-            _temperature: f64,
-        ) -> anyhow::Result<ChatResponse> {
-            let mut responses = self
-                .responses
-                .lock()
-                .expect("responses lock should be valid");
-            responses
-                .pop_front()
-                .ok_or_else(|| anyhow::anyhow!("scripted provider exhausted responses"))
-        }
-    }
-
-    struct CountingTool {
-        name: String,
-        invocations: Arc<AtomicUsize>,
-    }
-
-    impl CountingTool {
-        fn new(name: &str, invocations: Arc<AtomicUsize>) -> Self {
-            Self {
-                name: name.to_string(),
-                invocations,
-            }
-        }
-    }
-
-    #[async_trait]
-    impl Tool for CountingTool {
-        fn name(&self) -> &str {
-            &self.name
-        }
-
-        fn description(&self) -> &str {
-            "Counts executions for loop-stability tests"
-        }
-
-        fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "value": { "type": "string" }
-                }
-            })
-        }
-
-        async fn execute(
-            &self,
-            args: serde_json::Value,
-        ) -> anyhow::Result<crate::tools::ToolResult> {
-            self.invocations.fetch_add(1, Ordering::SeqCst);
-            let value = args
-                .get("value")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            Ok(crate::tools::ToolResult {
-                success: true,
-                output: format!("counted:{value}"),
-                error: None,
-            })
-        }
-    }
-
-    struct DelayTool {
-        name: String,
-        delay_ms: u64,
-        active: Arc<AtomicUsize>,
-        max_active: Arc<AtomicUsize>,
-    }
-
-    impl DelayTool {
-        fn new(
-            name: &str,
-            delay_ms: u64,
-            active: Arc<AtomicUsize>,
-            max_active: Arc<AtomicUsize>,
-        ) -> Self {
-            Self {
-                name: name.to_string(),
-                delay_ms,
-                active,
-                max_active,
-            }
-        }
-    }
-
-    #[async_trait]
-    impl Tool for DelayTool {
-        fn name(&self) -> &str {
-            &self.name
-        }
-
-        fn description(&self) -> &str {
-            "Delay tool for testing parallel tool execution"
-        }
-
-        fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "value": { "type": "string" }
-                },
-                "required": ["value"]
-            })
-        }
-
-        async fn execute(
-            &self,
-            args: serde_json::Value,
-        ) -> anyhow::Result<crate::tools::ToolResult> {
-            let now_active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
-            self.max_active.fetch_max(now_active, Ordering::SeqCst);
-
-            tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
-
-            self.active.fetch_sub(1, Ordering::SeqCst);
-
-            let value = args
-                .get("value")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-
-            Ok(crate::tools::ToolResult {
-                success: true,
-                output: format!("ok:{value}"),
-                error: None,
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn run_tool_call_loop_returns_structured_error_for_non_vision_provider() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let provider = NonVisionProvider {
-            calls: Arc::clone(&calls),
-        };
-
-        let mut history = vec![ChatMessage::user(
-            "please inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
-        )];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
-        let observer = NoopObserver;
-
-        let err = run_tool_call_loop(
-            &provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            0.0,
-            true,
-            None,
-            "cli",
-            &crate::config::MultimodalConfig::default(),
-            3,
-            None,
-            None,
-            None,
-            &[],
-        )
-        .await
-        .expect_err("provider without vision support should fail");
-
-        assert!(err.to_string().contains("provider_capability_error"));
-        assert!(err.to_string().contains("capability=vision"));
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn run_tool_call_loop_rejects_oversized_image_payload() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let provider = VisionProvider {
-            calls: Arc::clone(&calls),
-        };
-
-        let oversized_payload = STANDARD.encode(vec![0_u8; (1024 * 1024) + 1]);
-        let mut history = vec![ChatMessage::user(format!(
-            "[IMAGE:data:image/png;base64,{oversized_payload}]"
-        ))];
-
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
-        let observer = NoopObserver;
-        let multimodal = crate::config::MultimodalConfig {
-            max_images: 4,
-            max_image_size_mb: 1,
-            allow_remote_fetch: false,
-        };
-
-        let err = run_tool_call_loop(
-            &provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            0.0,
-            true,
-            None,
-            "cli",
-            &multimodal,
-            3,
-            None,
-            None,
-            None,
-            &[],
-        )
-        .await
-        .expect_err("oversized payload must fail");
-
-        assert!(err
-            .to_string()
-            .contains("multimodal image size limit exceeded"));
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn run_tool_call_loop_accepts_valid_multimodal_request_flow() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let provider = VisionProvider {
-            calls: Arc::clone(&calls),
-        };
-
-        let mut history = vec![ChatMessage::user(
-            "Analyze this [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
-        )];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
-        let observer = NoopObserver;
-
-        let result = run_tool_call_loop(
-            &provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            0.0,
-            true,
-            None,
-            "cli",
-            &crate::config::MultimodalConfig::default(),
-            3,
-            None,
-            None,
-            None,
-            &[],
-        )
-        .await
-        .expect("valid multimodal payload should pass");
-
-        assert_eq!(result, "vision-ok");
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn should_execute_tools_in_parallel_returns_false_for_single_call() {
-        let calls = vec![ParsedToolCall {
-            name: "file_read".to_string(),
-            arguments: serde_json::json!({"path": "a.txt"}),
-            tool_call_id: None,
-        }];
-
-        assert!(!should_execute_tools_in_parallel(&calls, None));
-    }
-
-    #[test]
-    fn should_execute_tools_in_parallel_returns_false_when_approval_is_required() {
-        let calls = vec![
-            ParsedToolCall {
-                name: "shell".to_string(),
-                arguments: serde_json::json!({"command": "pwd"}),
-                tool_call_id: None,
-            },
-            ParsedToolCall {
-                name: "http_request".to_string(),
-                arguments: serde_json::json!({"url": "https://example.com"}),
-                tool_call_id: None,
-            },
-        ];
-        let approval_cfg = crate::config::AutonomyConfig::default();
-        let approval_mgr = ApprovalManager::from_config(&approval_cfg);
-
-        assert!(!should_execute_tools_in_parallel(
-            &calls,
-            Some(&approval_mgr)
-        ));
-    }
-
-    #[test]
-    fn should_execute_tools_in_parallel_returns_true_when_cli_has_no_interactive_approvals() {
-        let calls = vec![
-            ParsedToolCall {
-                name: "shell".to_string(),
-                arguments: serde_json::json!({"command": "pwd"}),
-                tool_call_id: None,
-            },
-            ParsedToolCall {
-                name: "http_request".to_string(),
-                arguments: serde_json::json!({"url": "https://example.com"}),
-                tool_call_id: None,
-            },
-        ];
-        let approval_cfg = crate::config::AutonomyConfig {
-            level: crate::security::AutonomyLevel::Full,
-            ..crate::config::AutonomyConfig::default()
-        };
-        let approval_mgr = ApprovalManager::from_config(&approval_cfg);
-
-        assert!(should_execute_tools_in_parallel(
-            &calls,
-            Some(&approval_mgr)
-        ));
-    }
-
-    #[tokio::test]
-    async fn run_tool_call_loop_executes_multiple_tools_with_ordered_results() {
-        let provider = ScriptedProvider::from_text_responses(vec![
-            r#"<tool_call>
-{"name":"delay_a","arguments":{"value":"A"}}
-</tool_call>
-<tool_call>
-{"name":"delay_b","arguments":{"value":"B"}}
-</tool_call>"#,
-            "done",
-        ]);
-
-        let active = Arc::new(AtomicUsize::new(0));
-        let max_active = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![
-            Box::new(DelayTool::new(
-                "delay_a",
-                200,
-                Arc::clone(&active),
-                Arc::clone(&max_active),
-            )),
-            Box::new(DelayTool::new(
-                "delay_b",
-                200,
-                Arc::clone(&active),
-                Arc::clone(&max_active),
-            )),
-        ];
-
-        let approval_cfg = crate::config::AutonomyConfig {
-            level: crate::security::AutonomyLevel::Full,
-            ..crate::config::AutonomyConfig::default()
-        };
-        let approval_mgr = ApprovalManager::from_config(&approval_cfg);
-
-        let mut history = vec![
-            ChatMessage::system("test-system"),
-            ChatMessage::user("run tool calls"),
-        ];
-        let observer = NoopObserver;
-
-        let result = run_tool_call_loop(
-            &provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            0.0,
-            true,
-            Some(&approval_mgr),
-            "telegram",
-            &crate::config::MultimodalConfig::default(),
-            4,
-            None,
-            None,
-            None,
-            &[],
-        )
-        .await
-        .expect("parallel execution should complete");
-
-        assert_eq!(result, "done");
-        assert!(
-            max_active.load(Ordering::SeqCst) >= 1,
-            "tools should execute successfully"
-        );
-
-        let tool_results_message = history
-            .iter()
-            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
-            .expect("tool results message should be present");
-        let idx_a = tool_results_message
-            .content
-            .find("name=\"delay_a\"")
-            .expect("delay_a result should be present");
-        let idx_b = tool_results_message
-            .content
-            .find("name=\"delay_b\"")
-            .expect("delay_b result should be present");
-        assert!(
-            idx_a < idx_b,
-            "tool results should preserve input order for tool call mapping"
-        );
-    }
-
-    #[tokio::test]
-    async fn run_tool_call_loop_deduplicates_repeated_tool_calls() {
-        let provider = ScriptedProvider::from_text_responses(vec![
-            r#"<tool_call>
-{"name":"count_tool","arguments":{"value":"A"}}
-</tool_call>
-<tool_call>
-{"name":"count_tool","arguments":{"value":"A"}}
-</tool_call>"#,
-            "done",
-        ]);
-
-        let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "count_tool",
-            Arc::clone(&invocations),
-        ))];
-
-        let mut history = vec![
-            ChatMessage::system("test-system"),
-            ChatMessage::user("run tool calls"),
-        ];
-        let observer = NoopObserver;
-
-        let result = run_tool_call_loop(
-            &provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            0.0,
-            true,
-            None,
-            "cli",
-            &crate::config::MultimodalConfig::default(),
-            4,
-            None,
-            None,
-            None,
-            &[],
-        )
-        .await
-        .expect("loop should finish after deduplicating repeated calls");
-
-        assert_eq!(result, "done");
-        assert_eq!(
-            invocations.load(Ordering::SeqCst),
-            1,
-            "duplicate tool call with same args should not execute twice"
-        );
-
-        let tool_results = history
-            .iter()
-            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
-            .expect("prompt-mode tool result payload should be present");
-        assert!(tool_results.content.contains("counted:A"));
-        assert!(tool_results.content.contains("Skipped duplicate tool call"));
-    }
-
-    #[tokio::test]
-    async fn run_tool_call_loop_native_mode_preserves_fallback_tool_call_ids() {
-        let provider = ScriptedProvider::from_text_responses(vec![
-            r#"{"content":"Need to call tool","tool_calls":[{"id":"call_abc","name":"count_tool","arguments":"{\"value\":\"X\"}"}]}"#,
-            "done",
-        ])
-        .with_native_tool_support();
-
-        let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "count_tool",
-            Arc::clone(&invocations),
-        ))];
-
-        let mut history = vec![
-            ChatMessage::system("test-system"),
-            ChatMessage::user("run tool calls"),
-        ];
-        let observer = NoopObserver;
-
-        let result = run_tool_call_loop(
-            &provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            0.0,
-            true,
-            None,
-            "cli",
-            &crate::config::MultimodalConfig::default(),
-            4,
-            None,
-            None,
-            None,
-            &[],
-        )
-        .await
-        .expect("native fallback id flow should complete");
-
-        assert_eq!(result, "done");
-        assert_eq!(invocations.load(Ordering::SeqCst), 1);
-        assert!(
-            history.iter().any(|msg| {
-                msg.role == "tool" && msg.content.contains("\"tool_call_id\":\"call_abc\"")
-            }),
-            "tool result should preserve parsed fallback tool_call_id in native mode"
-        );
-        assert!(
-            history
-                .iter()
-                .all(|msg| !(msg.role == "user" && msg.content.starts_with("[Tool results]"))),
-            "native mode should use role=tool history instead of prompt fallback wrapper"
-        );
     }
 
     #[test]
@@ -4394,11 +3173,18 @@ Tail"#;
     #[test]
     fn build_tool_instructions_includes_all_tools() {
         use crate::security::SecurityPolicy;
+        let tmp = tempfile::TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::from_config(
             &crate::config::AutonomyConfig::default(),
             std::path::Path::new("/tmp"),
         ));
-        let tools = tools::default_tools(security);
+        let mem_cfg = crate::config::MemoryConfig {
+            backend: "markdown".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn crate::memory::Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let tools = tools::default_tools(security, mem);
         let instructions = build_tool_instructions(&tools);
 
         assert!(instructions.contains("## Tool Use Protocol"));
@@ -4411,11 +3197,18 @@ Tail"#;
     #[test]
     fn tools_to_openai_format_produces_valid_schema() {
         use crate::security::SecurityPolicy;
+        let tmp = tempfile::TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::from_config(
             &crate::config::AutonomyConfig::default(),
             std::path::Path::new("/tmp"),
         ));
-        let tools = tools::default_tools(security);
+        let mem_cfg = crate::config::MemoryConfig {
+            backend: "markdown".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn crate::memory::Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let tools = tools::default_tools(security, mem);
         let formatted = tools_to_openai_format(&tools);
 
         assert!(!formatted.is_empty());
@@ -5121,11 +3914,8 @@ Let me check the result."#;
             std::path::Path::new("/tmp"),
             "test-model",
             &tool_summaries,
-            &[],  // no skills
-            None, // no identity config
             None, // no bootstrap_max_chars
             true, // native_tools
-            crate::config::SkillsPromptInjectionMode::Full,
         );
 
         // Must contain zero XML protocol artifacts

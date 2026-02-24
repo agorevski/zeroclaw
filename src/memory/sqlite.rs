@@ -1,6 +1,4 @@
-use super::embeddings::EmbeddingProvider;
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
-use super::vector;
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Local;
@@ -13,6 +11,144 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
+
+// ── Embedding provider trait + noop (inlined from deleted embeddings.rs) ──
+
+/// Trait for embedding providers — convert text to vectors
+#[async_trait]
+pub trait EmbeddingProvider: Send + Sync {
+    fn name(&self) -> &str;
+    fn dimensions(&self) -> usize;
+    async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>>;
+    async fn embed_one(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+        let mut results = self.embed(&[text]).await?;
+        results
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("Empty embedding result"))
+    }
+}
+
+pub struct NoopEmbedding;
+
+#[async_trait]
+impl EmbeddingProvider for NoopEmbedding {
+    fn name(&self) -> &str {
+        "none"
+    }
+    fn dimensions(&self) -> usize {
+        0
+    }
+    async fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        Ok(Vec::new())
+    }
+}
+
+// ── Vector utilities (inlined from deleted vector.rs) ──
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0_f64;
+    let mut norm_a = 0.0_f64;
+    let mut norm_b = 0.0_f64;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let (x, y) = (f64::from(*x), f64::from(*y));
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
+    }
+    let denom = norm_a.sqrt() * norm_b.sqrt();
+    if !denom.is_finite() || denom < f64::EPSILON {
+        return 0.0;
+    }
+    let raw = dot / denom;
+    if !raw.is_finite() {
+        return 0.0;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let sim = raw.clamp(0.0, 1.0) as f32;
+    sim
+}
+
+fn vec_to_bytes(v: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(v.len() * 4);
+    for &f in v {
+        bytes.extend_from_slice(&f.to_le_bytes());
+    }
+    bytes
+}
+
+fn bytes_to_vec(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| {
+            let arr: [u8; 4] = chunk.try_into().unwrap_or([0; 4]);
+            f32::from_le_bytes(arr)
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct ScoredResult {
+    pub id: String,
+    pub vector_score: Option<f32>,
+    pub keyword_score: Option<f32>,
+    pub final_score: f32,
+}
+
+fn hybrid_merge(
+    vector_results: &[(String, f32)],
+    keyword_results: &[(String, f32)],
+    vector_weight: f32,
+    keyword_weight: f32,
+    limit: usize,
+) -> Vec<ScoredResult> {
+    use std::collections::HashMap;
+    let mut map: HashMap<String, ScoredResult> = HashMap::new();
+    for (id, score) in vector_results {
+        map.entry(id.clone())
+            .and_modify(|r| r.vector_score = Some(*score))
+            .or_insert_with(|| ScoredResult {
+                id: id.clone(),
+                vector_score: Some(*score),
+                keyword_score: None,
+                final_score: 0.0,
+            });
+    }
+    let max_kw = keyword_results
+        .iter()
+        .map(|(_, s)| *s)
+        .fold(0.0_f32, f32::max);
+    let max_kw = if max_kw < f32::EPSILON { 1.0 } else { max_kw };
+    for (id, score) in keyword_results {
+        let normalized = score / max_kw;
+        map.entry(id.clone())
+            .and_modify(|r| r.keyword_score = Some(normalized))
+            .or_insert_with(|| ScoredResult {
+                id: id.clone(),
+                vector_score: None,
+                keyword_score: Some(normalized),
+                final_score: 0.0,
+            });
+    }
+    let mut results: Vec<ScoredResult> = map
+        .into_values()
+        .map(|mut r| {
+            let vs = r.vector_score.unwrap_or(0.0);
+            let ks = r.keyword_score.unwrap_or(0.0);
+            r.final_score = vector_weight * vs + keyword_weight * ks;
+            r
+        })
+        .collect();
+    results.sort_by(|a, b| {
+        b.final_score
+            .partial_cmp(&a.final_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    results.truncate(limit);
+    results
+}
 
 /// Maximum allowed open timeout (seconds) to avoid unreasonable waits.
 const SQLITE_OPEN_TIMEOUT_CAP_SECS: u64 = 300;
@@ -38,7 +174,7 @@ impl SqliteMemory {
     pub fn new(workspace_dir: &Path) -> anyhow::Result<Self> {
         Self::with_embedder(
             workspace_dir,
-            Arc::new(super::embeddings::NoopEmbedding),
+            Arc::new(NoopEmbedding),
             0.7,
             0.3,
             10_000,
@@ -244,7 +380,7 @@ impl SqliteMemory {
                     "UPDATE embedding_cache SET accessed_at = ?1 WHERE content_hash = ?2",
                     params![now_c, hash_c],
                 )?;
-                return Ok(Some(vector::bytes_to_vec(&bytes)));
+                return Ok(Some(bytes_to_vec(&bytes)));
             }
             Ok(None)
         })
@@ -256,7 +392,7 @@ impl SqliteMemory {
 
         // Compute embedding (async I/O)
         let embedding = self.embedder.embed_one(text).await?;
-        let bytes = vector::vec_to_bytes(&embedding);
+        let bytes = vec_to_bytes(&embedding);
 
         // Store in cache + LRU eviction (offloaded to blocking thread)
         let conn = self.conn.clone();
@@ -364,8 +500,8 @@ impl SqliteMemory {
         let mut scored: Vec<(String, f32)> = Vec::new();
         for row in rows {
             let (id, blob) = row?;
-            let emb = vector::bytes_to_vec(&blob);
-            let sim = vector::cosine_similarity(query_embedding, &emb);
+            let emb = bytes_to_vec(&blob);
+            let sim = cosine_similarity(query_embedding, &emb);
             if sim > 0.0 {
                 scored.push((id, sim));
             }
@@ -410,7 +546,7 @@ impl SqliteMemory {
         let mut count = 0;
         for (id, content) in &entries {
             if let Ok(Some(emb)) = self.get_or_compute_embedding(content).await {
-                let bytes = vector::vec_to_bytes(&emb);
+                let bytes = vec_to_bytes(&emb);
                 let conn = self.conn.clone();
                 let id = id.clone();
                 tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
@@ -447,7 +583,7 @@ impl Memory for SqliteMemory {
         let embedding_bytes = self
             .get_or_compute_embedding(content)
             .await?
-            .map(|emb| vector::vec_to_bytes(&emb));
+            .map(|emb| vec_to_bytes(&emb));
 
         let conn = self.conn.clone();
         let key = key.to_string();
@@ -513,7 +649,7 @@ impl Memory for SqliteMemory {
             let merged = if vector_results.is_empty() {
                 keyword_results
                     .iter()
-                    .map(|(id, score)| vector::ScoredResult {
+                    .map(|(id, score)| ScoredResult {
                         id: id.clone(),
                         vector_score: None,
                         keyword_score: Some(*score),
@@ -521,7 +657,7 @@ impl Memory for SqliteMemory {
                     })
                     .collect::<Vec<_>>()
             } else {
-                vector::hybrid_merge(
+                hybrid_merge(
                     &vector_results,
                     &keyword_results,
                     vector_weight,
@@ -1222,7 +1358,7 @@ mod tests {
     #[test]
     fn open_with_timeout_succeeds_when_fast() {
         let tmp = TempDir::new().unwrap();
-        let embedder = Arc::new(super::super::embeddings::NoopEmbedding);
+        let embedder = Arc::new(super::NoopEmbedding);
         let mem = SqliteMemory::with_embedder(tmp.path(), embedder, 0.7, 0.3, 1000, Some(5));
         assert!(
             mem.is_ok(),
@@ -1236,7 +1372,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mem = SqliteMemory::with_embedder(
             tmp.path(),
-            Arc::new(super::super::embeddings::NoopEmbedding),
+            Arc::new(super::NoopEmbedding),
             0.7,
             0.3,
             1000,
@@ -1260,7 +1396,7 @@ mod tests {
     #[test]
     fn with_embedder_noop() {
         let tmp = TempDir::new().unwrap();
-        let embedder = Arc::new(super::super::embeddings::NoopEmbedding);
+        let embedder = Arc::new(super::NoopEmbedding);
         let mem = SqliteMemory::with_embedder(tmp.path(), embedder, 0.7, 0.3, 1000, None);
         assert!(mem.is_ok());
         assert_eq!(mem.unwrap().name(), "sqlite");

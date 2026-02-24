@@ -99,11 +99,13 @@ fn gateway_config_idempotency_defaults() {
 
 #[test]
 fn gateway_config_toml_roundtrip() {
-    let mut gw = GatewayConfig::default();
-    gw.port = 8080;
-    gw.host = "0.0.0.0".into();
-    gw.require_pairing = false;
-    gw.pair_rate_limit_per_minute = 5;
+    let gw = GatewayConfig {
+        port: 8080,
+        host: "0.0.0.0".into(),
+        require_pairing: false,
+        pair_rate_limit_per_minute: 5,
+        ..GatewayConfig::default()
+    };
 
     let toml_str = toml::to_string(&gw).expect("gateway config should serialize");
     let parsed: GatewayConfig = toml::from_str(&toml_str).expect("should deserialize back");
@@ -148,23 +150,17 @@ port = 9090
 #[test]
 fn security_config_defaults() {
     let sec = SecurityConfig::default();
-    assert!(
-        sec.sandbox.enabled.is_none(),
-        "sandbox enabled should auto-detect (None) by default"
-    );
     assert!(sec.audit.enabled, "audit should be enabled by default");
 }
 
 #[test]
 fn security_config_toml_roundtrip() {
     let mut sec = SecurityConfig::default();
-    sec.sandbox.enabled = Some(true);
     sec.audit.max_size_mb = 200;
 
     let toml_str = toml::to_string(&sec).expect("SecurityConfig should serialize");
     let parsed: SecurityConfig = toml::from_str(&toml_str).expect("should deserialize back");
 
-    assert_eq!(parsed.sandbox.enabled, Some(true));
     assert_eq!(parsed.audit.max_size_mb, 200);
 }
 
@@ -260,34 +256,27 @@ value = 123
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn config_multiple_channels_coexist() {
+fn config_whatsapp_channel_coexists_with_cli() {
     let toml_str = r#"
 default_temperature = 0.7
 
 [channels_config]
 cli = true
 
-[channels_config.telegram]
-bot_token = "test_token"
-allowed_users = ["zeroclaw_user"]
-
-[channels_config.discord]
-bot_token = "test_token"
+[channels_config.whatsapp]
+access_token = "test_token"
+phone_number_id = "12345"
 "#;
-    let parsed: Config = toml::from_str(toml_str).expect("multi-channel config should parse");
-    assert!(parsed.channels_config.telegram.is_some());
-    assert!(parsed.channels_config.discord.is_some());
-    assert!(parsed.channels_config.slack.is_none());
+    let parsed: Config = toml::from_str(toml_str).expect("whatsapp channel config should parse");
+    assert!(parsed.channels_config.whatsapp.is_some());
+    assert!(parsed.channels_config.cli);
 }
 
 #[test]
 fn config_nested_optional_sections_default_when_absent() {
     let toml_str = "default_temperature = 0.7\n";
     let parsed: Config = toml::from_str(toml_str).expect("minimal TOML should parse");
-    assert!(parsed.channels_config.telegram.is_none());
-    assert!(!parsed.composio.enabled);
-    assert!(parsed.composio.api_key.is_none());
-    assert!(!parsed.browser.enabled);
+    assert!(parsed.channels_config.whatsapp.is_none());
 }
 
 #[test]
@@ -299,13 +288,7 @@ fn config_channels_default_cli_enabled() {
 #[test]
 fn config_channels_all_optional_channels_none_by_default() {
     let channels = ChannelsConfig::default();
-    assert!(channels.telegram.is_none());
-    assert!(channels.discord.is_none());
-    assert!(channels.slack.is_none());
-    assert!(channels.matrix.is_none());
-    assert!(channels.lark.is_none());
-    assert!(channels.feishu.is_none());
-    assert!(channels.webhook.is_none());
+    assert!(channels.whatsapp.is_none());
 }
 
 #[test]

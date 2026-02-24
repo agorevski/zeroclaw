@@ -28,13 +28,8 @@ pub struct Agent {
     model_name: String,
     temperature: f64,
     workspace_dir: std::path::PathBuf,
-    identity_config: crate::config::IdentityConfig,
-    skills: Vec<crate::skills::Skill>,
-    skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     auto_save: bool,
     history: Vec<ConversationMessage>,
-    classification_config: crate::config::QueryClassificationConfig,
-    available_hints: Vec<String>,
 }
 
 pub struct AgentBuilder {
@@ -49,12 +44,7 @@ pub struct AgentBuilder {
     model_name: Option<String>,
     temperature: Option<f64>,
     workspace_dir: Option<std::path::PathBuf>,
-    identity_config: Option<crate::config::IdentityConfig>,
-    skills: Option<Vec<crate::skills::Skill>>,
-    skills_prompt_mode: Option<crate::config::SkillsPromptInjectionMode>,
     auto_save: Option<bool>,
-    classification_config: Option<crate::config::QueryClassificationConfig>,
-    available_hints: Option<Vec<String>>,
 }
 
 impl AgentBuilder {
@@ -71,12 +61,7 @@ impl AgentBuilder {
             model_name: None,
             temperature: None,
             workspace_dir: None,
-            identity_config: None,
-            skills: None,
-            skills_prompt_mode: None,
             auto_save: None,
-            classification_config: None,
-            available_hints: None,
         }
     }
 
@@ -135,39 +120,8 @@ impl AgentBuilder {
         self
     }
 
-    pub fn identity_config(mut self, identity_config: crate::config::IdentityConfig) -> Self {
-        self.identity_config = Some(identity_config);
-        self
-    }
-
-    pub fn skills(mut self, skills: Vec<crate::skills::Skill>) -> Self {
-        self.skills = Some(skills);
-        self
-    }
-
-    pub fn skills_prompt_mode(
-        mut self,
-        skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
-    ) -> Self {
-        self.skills_prompt_mode = Some(skills_prompt_mode);
-        self
-    }
-
     pub fn auto_save(mut self, auto_save: bool) -> Self {
         self.auto_save = Some(auto_save);
-        self
-    }
-
-    pub fn classification_config(
-        mut self,
-        classification_config: crate::config::QueryClassificationConfig,
-    ) -> Self {
-        self.classification_config = Some(classification_config);
-        self
-    }
-
-    pub fn available_hints(mut self, available_hints: Vec<String>) -> Self {
-        self.available_hints = Some(available_hints);
         self
     }
 
@@ -206,13 +160,8 @@ impl AgentBuilder {
             workspace_dir: self
                 .workspace_dir
                 .unwrap_or_else(|| std::path::PathBuf::from(".")),
-            identity_config: self.identity_config.unwrap_or_default(),
-            skills: self.skills.unwrap_or_default(),
-            skills_prompt_mode: self.skills_prompt_mode.unwrap_or_default(),
             auto_save: self.auto_save.unwrap_or(false),
             history: Vec::new(),
-            classification_config: self.classification_config.unwrap_or_default(),
-            available_hints: self.available_hints.unwrap_or_default(),
         })
     }
 }
@@ -240,39 +189,13 @@ impl Agent {
             &config.workspace_dir,
         ));
 
-        let memory: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes(
+        let memory: Arc<dyn Memory> = Arc::from(memory::create_memory(
             &config.memory,
-            &config.embedding_routes,
-            Some(&config.storage.provider.config),
             &config.workspace_dir,
             config.api_key.as_deref(),
         )?);
 
-        let composio_key = if config.composio.enabled {
-            config.composio.api_key.as_deref()
-        } else {
-            None
-        };
-        let composio_entity_id = if config.composio.enabled {
-            Some(config.composio.entity_id.as_str())
-        } else {
-            None
-        };
-
-        let tools = tools::all_tools_with_runtime(
-            Arc::new(config.clone()),
-            &security,
-            runtime,
-            memory.clone(),
-            composio_key,
-            composio_entity_id,
-            &config.browser,
-            &config.http_request,
-            &config.workspace_dir,
-            &config.agents,
-            config.api_key.as_deref(),
-            config,
-        );
+        let tools = tools::default_tools_with_runtime(security, runtime, memory.clone());
 
         let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
 
@@ -282,13 +205,10 @@ impl Agent {
             .unwrap_or("anthropic/claude-sonnet-4-20250514")
             .to_string();
 
-        let provider: Box<dyn Provider> = providers::create_routed_provider(
+        let provider: Box<dyn Provider> = providers::create_provider_with_url(
             provider_name,
             config.api_key.as_deref(),
             config.api_url.as_deref(),
-            &config.reliability,
-            &config.model_routes,
-            &model_name,
         )?;
 
         let dispatcher_choice = config.agent.tool_dispatcher.as_str();
@@ -298,9 +218,6 @@ impl Agent {
             _ if provider.supports_native_tools() => Box::new(NativeToolDispatcher),
             _ => Box::new(XmlToolDispatcher),
         };
-
-        let available_hints: Vec<String> =
-            config.model_routes.iter().map(|r| r.hint.clone()).collect();
 
         Agent::builder()
             .provider(provider)
@@ -317,14 +234,6 @@ impl Agent {
             .model_name(model_name)
             .temperature(config.default_temperature)
             .workspace_dir(config.workspace_dir.clone())
-            .classification_config(config.query_classification.clone())
-            .available_hints(available_hints)
-            .identity_config(config.identity.clone())
-            .skills(crate::skills::load_skills_with_config(
-                &config.workspace_dir,
-                config,
-            ))
-            .skills_prompt_mode(config.skills.prompt_injection_mode)
             .auto_save(config.memory.auto_save)
             .build()
     }
@@ -362,9 +271,6 @@ impl Agent {
             workspace_dir: &self.workspace_dir,
             model_name: &self.model_name,
             tools: &self.tools,
-            skills: &self.skills,
-            skills_prompt_mode: self.skills_prompt_mode,
-            identity_config: Some(&self.identity_config),
             dispatcher_instructions: &instructions,
         };
         self.prompt_builder.build(&ctx)
@@ -424,13 +330,7 @@ impl Agent {
         futures_util::future::join_all(futs).await
     }
 
-    fn classify_model(&self, user_message: &str) -> String {
-        if let Some(hint) = super::classifier::classify(&self.classification_config, user_message) {
-            if self.available_hints.contains(&hint) {
-                tracing::info!(hint = hint.as_str(), "Auto-classified query");
-                return format!("hint:{hint}");
-            }
-        }
+    fn classify_model(&self, _user_message: &str) -> String {
         self.model_name.clone()
     }
 
@@ -541,15 +441,25 @@ impl Agent {
         println!("🦀 ZeroClaw Interactive Mode");
         println!("Type /quit to exit.\n");
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
-        let cli = crate::channels::CliChannel::new();
+        let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+        use tokio::io::AsyncBufReadExt;
+        let mut lines = stdin.lines();
 
-        let listen_handle = tokio::spawn(async move {
-            let _ = crate::channels::Channel::listen(&cli, tx).await;
-        });
-
-        while let Some(msg) = rx.recv().await {
-            let response = match self.turn(&msg.content).await {
+        loop {
+            print!("> ");
+            let _ = std::io::stdout().flush();
+            let line = match lines.next_line().await? {
+                Some(l) => l,
+                None => break,
+            };
+            let trimmed = line.trim();
+            if trimmed == "/quit" || trimmed == "/exit" {
+                break;
+            }
+            if trimmed.is_empty() {
+                continue;
+            }
+            let response = match self.turn(trimmed).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     eprintln!("\nError: {e}\n");
@@ -559,7 +469,6 @@ impl Agent {
             println!("\n{response}\n");
         }
 
-        listen_handle.abort();
         Ok(())
     }
 }

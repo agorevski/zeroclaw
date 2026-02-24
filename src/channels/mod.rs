@@ -14,62 +14,14 @@
 //! To add a new channel, implement [`Channel`] in a new submodule and wire it into
 //! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
 
-pub mod clawdtalk;
-pub mod cli;
-pub mod dingtalk;
-pub mod discord;
-pub mod email_channel;
-pub mod imessage;
-pub mod irc;
-#[cfg(feature = "channel-lark")]
-pub mod lark;
-pub mod linq;
-#[cfg(feature = "channel-matrix")]
-pub mod matrix;
-pub mod mattermost;
-pub mod nextcloud_talk;
-pub mod nostr;
-pub mod qq;
-pub mod signal;
-pub mod slack;
-pub mod telegram;
 pub mod traits;
-pub mod transcription;
-pub mod wati;
 pub mod whatsapp;
-#[cfg(feature = "whatsapp-web")]
-pub mod whatsapp_storage;
-#[cfg(feature = "whatsapp-web")]
-pub mod whatsapp_web;
 
-pub use clawdtalk::{ClawdTalkChannel, ClawdTalkConfig};
-pub use cli::CliChannel;
-pub use dingtalk::DingTalkChannel;
-pub use discord::DiscordChannel;
-pub use email_channel::EmailChannel;
-pub use imessage::IMessageChannel;
-pub use irc::IrcChannel;
-#[cfg(feature = "channel-lark")]
-pub use lark::LarkChannel;
-pub use linq::LinqChannel;
-#[cfg(feature = "channel-matrix")]
-pub use matrix::MatrixChannel;
-pub use mattermost::MattermostChannel;
-pub use nextcloud_talk::NextcloudTalkChannel;
-pub use nostr::NostrChannel;
-pub use qq::QQChannel;
-pub use signal::SignalChannel;
-pub use slack::SlackChannel;
-pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
-pub use wati::WatiChannel;
 pub use whatsapp::WhatsAppChannel;
-#[cfg(feature = "whatsapp-web")]
-pub use whatsapp_web::WhatsAppWebChannel;
 
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, scrub_credentials};
 use crate::config::Config;
-use crate::identity;
 use crate::memory::{self, Memory};
 use crate::observability::{self, runtime_trace, Observer};
 use crate::providers::{self, ChatMessage, Provider};
@@ -120,8 +72,6 @@ const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
 const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
 const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
 const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
-/// Guardrail for hook-modified outbound channel content.
-const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
 
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
@@ -171,7 +121,6 @@ struct ChannelRuntimeDefaults {
     temperature: f64,
     api_key: Option<String>,
     api_url: Option<String>,
-    reliability: crate::config::ReliabilityConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,13 +164,10 @@ struct ChannelRuntimeContext {
     route_overrides: RouteSelectionMap,
     api_key: Option<String>,
     api_url: Option<String>,
-    reliability: Arc<crate::config::ReliabilityConfig>,
     provider_runtime_options: providers::ProviderRuntimeOptions,
     workspace_dir: Arc<PathBuf>,
     message_timeout_secs: u64,
     interrupt_on_new_message: bool,
-    multimodal: crate::config::MultimodalConfig,
-    hooks: Option<Arc<crate::hooks::HookRunner>>,
     non_cli_excluded_tools: Arc<Vec<String>>,
 }
 
@@ -386,24 +332,8 @@ fn strip_tool_call_tags(message: &str) -> String {
     result.trim().to_string()
 }
 
-fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
-    match channel_name {
-        "telegram" => Some(
-            "When responding on Telegram:\n\
-             - Include media markers for files or URLs that should be sent as attachments\n\
-             - Use **bold** for key terms, section titles, and important info (renders as <b>)\n\
-             - Use *italic* for emphasis (renders as <i>)\n\
-             - Use `backticks` for inline code, commands, or technical terms\n\
-             - Use triple backticks for code blocks\n\
-             - Use emoji naturally to add personality — but don't overdo it\n\
-             - Be concise and direct. Skip filler phrases like 'Great question!' or 'Certainly!'\n\
-             - Structure longer answers with bold headers, not raw markdown ## headers\n\
-             - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
-             - Keep normal text outside markers and never wrap markers in code fences.\n\
-             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
-        ),
-        _ => None,
-    }
+fn channel_delivery_instructions(_channel_name: &str) -> Option<&'static str> {
+    None
 }
 
 fn build_channel_system_prompt(base_prompt: &str, channel_name: &str) -> String {
@@ -451,8 +381,8 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
     normalized
 }
 
-fn supports_runtime_model_switch(channel_name: &str) -> bool {
-    matches!(channel_name, "telegram" | "discord")
+fn supports_runtime_model_switch(_channel_name: &str) -> bool {
+    false
 }
 
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
@@ -537,7 +467,6 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
         temperature: config.default_temperature,
         api_key: config.api_key.clone(),
         api_url: config.api_url.clone(),
-        reliability: config.reliability.clone(),
     }
 }
 
@@ -564,7 +493,6 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
         temperature: ctx.temperature,
         api_key: ctx.api_key.clone(),
         api_url: ctx.api_url.clone(),
-        reliability: (*ctx.reliability).clone(),
     }
 }
 
@@ -632,12 +560,10 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     }
 
     let next_defaults = load_runtime_defaults_from_config_file(&config_path).await?;
-    let next_default_provider = providers::create_resilient_provider_with_options(
+    let next_default_provider = providers::create_provider_with_url(
         &next_defaults.default_provider,
         next_defaults.api_key.as_deref(),
         next_defaults.api_url.as_deref(),
-        &next_defaults.reliability,
-        &ctx.provider_runtime_options,
     )?;
     let next_default_provider: Arc<dyn Provider> = Arc::from(next_default_provider);
 
@@ -872,7 +798,6 @@ async fn get_or_create_provider(
         provider_name,
         ctx.api_key.clone(),
         api_url.map(ToString::to_string),
-        ctx.reliability.as_ref().clone(),
         ctx.provider_runtime_options.clone(),
     )
     .await?;
@@ -893,17 +818,14 @@ async fn create_resilient_provider_nonblocking(
     provider_name: &str,
     api_key: Option<String>,
     api_url: Option<String>,
-    reliability: crate::config::ReliabilityConfig,
-    provider_runtime_options: providers::ProviderRuntimeOptions,
+    _provider_runtime_options: providers::ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
     let provider_name = provider_name.to_string();
     tokio::task::spawn_blocking(move || {
-        providers::create_resilient_provider_with_options(
+        providers::create_provider_with_url(
             &provider_name,
             api_key.as_deref(),
             api_url.as_deref(),
-            &reliability,
-            &provider_runtime_options,
         )
     })
     .await
@@ -1264,9 +1186,7 @@ fn sanitize_tool_json_value(
         return None;
     }
 
-    let Some(object) = value.as_object() else {
-        return None;
-    };
+    let object = value.as_object()?;
 
     if let Some(tool_calls) = object.get("tool_calls").and_then(|value| value.as_array()) {
         if !tool_calls.is_empty()
@@ -1306,7 +1226,7 @@ fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<
     let mut saw_tool_call_payload = false;
 
     while cursor < message.len() {
-        let Some(rel_start) = message[cursor..].find(|ch: char| ch == '{' || ch == '[') else {
+        let Some(rel_start) = message[cursor..].find(['{', '[']) else {
             cleaned.push_str(&message[cursor..]);
             break;
         };
@@ -1505,19 +1425,6 @@ async fn process_channel_message(
         }),
     );
 
-    // ── Hook: on_message_received (modifying) ────────────
-    let msg = if let Some(hooks) = &ctx.hooks {
-        match hooks.run_on_message_received(msg).await {
-            crate::hooks::HookResult::Cancel(reason) => {
-                tracing::info!(%reason, "incoming message dropped by hook");
-                return;
-            }
-            crate::hooks::HookResult::Continue(modified) => modified,
-        }
-    } else {
-        msg
-    };
-
     let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
     if let Err(err) = maybe_apply_runtime_config_update(ctx.as_ref()).await {
         tracing::warn!("Failed to apply runtime config update: {err}");
@@ -1710,13 +1617,10 @@ async fn process_channel_message(
                 route.model.as_str(),
                 runtime_defaults.temperature,
                 true,
-                None,
                 msg.channel.as_str(),
-                &ctx.multimodal,
                 ctx.max_tool_iterations,
                 Some(cancellation_token.clone()),
                 delta_tx,
-                ctx.hooks.as_deref(),
                 if msg.channel == "cli" {
                     &[]
                 } else {
@@ -1771,63 +1675,7 @@ async fn process_channel_message(
             }
         }
         LlmExecutionResult::Completed(Ok(Ok(response))) => {
-            // ── Hook: on_message_sending (modifying) ─────────
-            let mut outbound_response = response;
-            if let Some(hooks) = &ctx.hooks {
-                match hooks
-                    .run_on_message_sending(
-                        msg.channel.clone(),
-                        msg.reply_target.clone(),
-                        outbound_response.clone(),
-                    )
-                    .await
-                {
-                    crate::hooks::HookResult::Cancel(reason) => {
-                        tracing::info!(%reason, "outgoing message suppressed by hook");
-                        return;
-                    }
-                    crate::hooks::HookResult::Continue((
-                        hook_channel,
-                        hook_recipient,
-                        mut modified_content,
-                    )) => {
-                        if hook_channel != msg.channel || hook_recipient != msg.reply_target {
-                            tracing::warn!(
-                                from_channel = %msg.channel,
-                                from_recipient = %msg.reply_target,
-                                to_channel = %hook_channel,
-                                to_recipient = %hook_recipient,
-                                "on_message_sending attempted to rewrite channel routing; only content mutation is applied"
-                            );
-                        }
-
-                        let modified_len = modified_content.chars().count();
-                        if modified_len > CHANNEL_HOOK_MAX_OUTBOUND_CHARS {
-                            tracing::warn!(
-                                limit = CHANNEL_HOOK_MAX_OUTBOUND_CHARS,
-                                attempted = modified_len,
-                                "hook-modified outbound content exceeded limit; truncating"
-                            );
-                            modified_content = truncate_with_ellipsis(
-                                &modified_content,
-                                CHANNEL_HOOK_MAX_OUTBOUND_CHARS,
-                            );
-                        }
-
-                        if modified_content != outbound_response {
-                            tracing::info!(
-                                channel = %msg.channel,
-                                sender = %msg.sender,
-                                before_len = outbound_response.chars().count(),
-                                after_len = modified_content.chars().count(),
-                                "outgoing message content modified by hook"
-                            );
-                        }
-
-                        outbound_response = modified_content;
-                    }
-                }
-            }
+            let outbound_response = response;
 
             let sanitized_response =
                 sanitize_channel_response(&outbound_response, ctx.tools_registry.as_ref());
@@ -2182,19 +2030,15 @@ fn load_openclaw_bootstrap_files(
     inject_workspace_file(prompt, workspace_dir, "MEMORY.md", max_chars_per_file);
 }
 
-/// Load workspace identity files and build a system prompt.
+/// Load workspace bootstrap files and build a system prompt.
 ///
-/// Follows the `OpenClaw` framework structure by default:
+/// Follows the `OpenClaw` framework structure:
 /// 1. Tooling — tool list + descriptions
 /// 2. Safety — guardrail reminder
-/// 3. Skills — full skill instructions and tool metadata
-/// 4. Workspace — working directory
-/// 5. Bootstrap files — AGENTS, SOUL, TOOLS, IDENTITY, USER, BOOTSTRAP, MEMORY
-/// 6. Date & Time — timezone for cache stability
-/// 7. Runtime — host, OS, model
-///
-/// When `identity_config` is set to AIEOS format, the bootstrap files section
-/// is replaced with the AIEOS identity data loaded from file or inline JSON.
+/// 3. Workspace — working directory
+/// 4. Bootstrap files — AGENTS, SOUL, TOOLS, IDENTITY, USER, BOOTSTRAP, MEMORY
+/// 5. Date & Time — timezone for cache stability
+/// 6. Runtime — host, OS, model
 ///
 /// Daily memory files (`memory/*.md`) are NOT injected — they are accessed
 /// on-demand via `memory_recall` / `memory_search` tools.
@@ -2202,19 +2046,14 @@ pub fn build_system_prompt(
     workspace_dir: &std::path::Path,
     model_name: &str,
     tools: &[(&str, &str)],
-    skills: &[crate::skills::Skill],
-    identity_config: Option<&crate::config::IdentityConfig>,
     bootstrap_max_chars: Option<usize>,
 ) -> String {
     build_system_prompt_with_mode(
         workspace_dir,
         model_name,
         tools,
-        skills,
-        identity_config,
         bootstrap_max_chars,
         false,
-        crate::config::SkillsPromptInjectionMode::Full,
     )
 }
 
@@ -2222,11 +2061,8 @@ pub fn build_system_prompt_with_mode(
     workspace_dir: &std::path::Path,
     model_name: &str,
     tools: &[(&str, &str)],
-    skills: &[crate::skills::Skill],
-    identity_config: Option<&crate::config::IdentityConfig>,
     bootstrap_max_chars: Option<usize>,
     native_tools: bool,
-    skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
@@ -2289,17 +2125,7 @@ pub fn build_system_prompt_with_mode(
          - When in doubt, ask before acting externally.\n\n",
     );
 
-    // ── 3. Skills (full or compact, based on config) ─────────────
-    if !skills.is_empty() {
-        prompt.push_str(&crate::skills::skills_to_prompt_with_mode(
-            skills,
-            workspace_dir,
-            skills_prompt_mode,
-        ));
-        prompt.push_str("\n\n");
-    }
-
-    // ── 4. Workspace ────────────────────────────────────────────
+    // ── 3. Workspace ────────────────────────────────────────────
     let _ = writeln!(
         prompt,
         "## Workspace\n\nWorking directory: `{}`\n",
@@ -2309,43 +2135,8 @@ pub fn build_system_prompt_with_mode(
     // ── 5. Bootstrap files (injected into context) ──────────────
     prompt.push_str("## Project Context\n\n");
 
-    // Check if AIEOS identity is configured
-    if let Some(config) = identity_config {
-        if identity::is_aieos_configured(config) {
-            // Load AIEOS identity
-            match identity::load_aieos_identity(config, workspace_dir) {
-                Ok(Some(aieos_identity)) => {
-                    let aieos_prompt = identity::aieos_to_system_prompt(&aieos_identity);
-                    if !aieos_prompt.is_empty() {
-                        prompt.push_str(&aieos_prompt);
-                        prompt.push_str("\n\n");
-                    }
-                }
-                Ok(None) => {
-                    // No AIEOS identity loaded (shouldn't happen if is_aieos_configured returned true)
-                    // Fall back to OpenClaw bootstrap files
-                    let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-                    load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
-                }
-                Err(e) => {
-                    // Log error but don't fail - fall back to OpenClaw
-                    eprintln!(
-                        "Warning: Failed to load AIEOS identity: {e}. Using OpenClaw format."
-                    );
-                    let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-                    load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
-                }
-            }
-        } else {
-            // OpenClaw format
-            let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-            load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
-        }
-    } else {
-        // No identity config - use OpenClaw format
-        let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-        load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
-    }
+    let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
+    load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
 
     // ── 6. Date & Time ──────────────────────────────────────────
     let now = chrono::Local::now();
@@ -2425,61 +2216,7 @@ fn inject_workspace_file(
     }
 }
 
-fn normalize_telegram_identity(value: &str) -> String {
-    value.trim().trim_start_matches('@').to_string()
-}
 
-async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
-    let normalized = normalize_telegram_identity(identity);
-    if normalized.is_empty() {
-        anyhow::bail!("Telegram identity cannot be empty");
-    }
-
-    let mut updated = config.clone();
-    let Some(telegram) = updated.channels_config.telegram.as_mut() else {
-        anyhow::bail!(
-            "Telegram channel is not configured. Run `zeroclaw onboard --channels-only` first"
-        );
-    };
-
-    if telegram.allowed_users.iter().any(|u| u == "*") {
-        println!(
-            "⚠️ Telegram allowlist is currently wildcard (`*`) — binding is unnecessary until you remove '*'."
-        );
-    }
-
-    if telegram
-        .allowed_users
-        .iter()
-        .map(|entry| normalize_telegram_identity(entry))
-        .any(|entry| entry == normalized)
-    {
-        println!("✅ Telegram identity already bound: {normalized}");
-        return Ok(());
-    }
-
-    telegram.allowed_users.push(normalized.clone());
-    updated.save().await?;
-    println!("✅ Bound Telegram identity: {normalized}");
-    println!("   Saved to {}", updated.config_path.display());
-    match maybe_restart_managed_daemon_service() {
-        Ok(true) => {
-            println!("🔄 Detected running managed daemon service; reloaded automatically.");
-        }
-        Ok(false) => {
-            println!(
-                "ℹ️ No managed daemon service detected. If `zeroclaw daemon`/`channel start` is already running, restart it to load the updated allowlist."
-            );
-        }
-        Err(e) => {
-            eprintln!(
-                "⚠️ Allowlist saved, but failed to reload daemon service automatically: {e}\n\
-                 Restart service manually with `zeroclaw service stop && zeroclaw service start`."
-            );
-        }
-    }
-    Ok(())
-}
 
 fn maybe_restart_managed_daemon_service() -> Result<bool> {
     if cfg!(target_os = "macos") {
@@ -2576,6 +2313,7 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
     Ok(false)
 }
 
+#[allow(clippy::unused_async)]
 pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Config) -> Result<()> {
     match command {
         crate::ChannelCommands::Start => {
@@ -2586,23 +2324,12 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
         }
         crate::ChannelCommands::List => {
             println!("Channels:");
-            println!("  ✅ CLI (always available)");
-            for (channel, configured) in config.channels_config.channels() {
-                println!(
-                    "  {} {}",
-                    if configured { "✅" } else { "❌" },
-                    channel.name()
-                );
+            let configured = collect_configured_channels(config, "list");
+            if configured.is_empty() {
+                println!("  ❌ No channels configured");
             }
-            if !cfg!(feature = "channel-matrix") {
-                println!(
-                    "  ℹ️ Matrix channel support is disabled in this build (enable `channel-matrix`)."
-                );
-            }
-            if !cfg!(feature = "channel-lark") {
-                println!(
-                    "  ℹ️ Lark/Feishu channel support is disabled in this build (enable `channel-lark`)."
-                );
+            for ch in &configured {
+                println!("  ✅ {}", ch.display_name);
             }
             println!("\nTo start channels: zeroclaw channel start");
             println!("To check health:    zeroclaw channel doctor");
@@ -2620,8 +2347,8 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
         crate::ChannelCommands::Remove { name } => {
             anyhow::bail!("Remove channel '{name}' — edit ~/.zeroclaw/config.toml directly");
         }
-        crate::ChannelCommands::BindTelegram { identity } => {
-            bind_telegram_identity(config, &identity).await
+        crate::ChannelCommands::BindTelegram { identity: _ } => {
+            anyhow::bail!("Telegram channel has been removed; bind-telegram is no longer supported")
         }
     }
 }
@@ -2650,285 +2377,24 @@ struct ConfiguredChannel {
 
 fn collect_configured_channels(
     config: &Config,
-    _matrix_skip_context: &str,
+    _context: &str,
 ) -> Vec<ConfiguredChannel> {
     let mut channels = Vec::new();
 
-    if let Some(ref tg) = config.channels_config.telegram {
-        channels.push(ConfiguredChannel {
-            display_name: "Telegram",
-            channel: Arc::new(
-                TelegramChannel::new(
-                    tg.bot_token.clone(),
-                    tg.allowed_users.clone(),
-                    tg.mention_only,
-                )
-                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
-                .with_transcription(config.transcription.clone())
-                .with_workspace_dir(config.workspace_dir.clone()),
-            ),
-        });
-    }
-
-    if let Some(ref dc) = config.channels_config.discord {
-        channels.push(ConfiguredChannel {
-            display_name: "Discord",
-            channel: Arc::new(DiscordChannel::new(
-                dc.bot_token.clone(),
-                dc.guild_id.clone(),
-                dc.allowed_users.clone(),
-                dc.listen_to_bots,
-                dc.mention_only,
-            )),
-        });
-    }
-
-    if let Some(ref sl) = config.channels_config.slack {
-        channels.push(ConfiguredChannel {
-            display_name: "Slack",
-            channel: Arc::new(SlackChannel::new(
-                sl.bot_token.clone(),
-                sl.channel_id.clone(),
-                sl.allowed_users.clone(),
-            )),
-        });
-    }
-
-    if let Some(ref mm) = config.channels_config.mattermost {
-        channels.push(ConfiguredChannel {
-            display_name: "Mattermost",
-            channel: Arc::new(MattermostChannel::new(
-                mm.url.clone(),
-                mm.bot_token.clone(),
-                mm.channel_id.clone(),
-                mm.allowed_users.clone(),
-                mm.thread_replies.unwrap_or(true),
-                mm.mention_only.unwrap_or(false),
-            )),
-        });
-    }
-
-    if let Some(ref im) = config.channels_config.imessage {
-        channels.push(ConfiguredChannel {
-            display_name: "iMessage",
-            channel: Arc::new(IMessageChannel::new(im.allowed_contacts.clone())),
-        });
-    }
-
-    #[cfg(feature = "channel-matrix")]
-    if let Some(ref mx) = config.channels_config.matrix {
-        channels.push(ConfiguredChannel {
-            display_name: "Matrix",
-            channel: Arc::new(MatrixChannel::new_with_session_hint_and_zeroclaw_dir(
-                mx.homeserver.clone(),
-                mx.access_token.clone(),
-                mx.room_id.clone(),
-                mx.allowed_users.clone(),
-                mx.user_id.clone(),
-                mx.device_id.clone(),
-                config.config_path.parent().map(|path| path.to_path_buf()),
-            )),
-        });
-    }
-
-    #[cfg(not(feature = "channel-matrix"))]
-    if config.channels_config.matrix.is_some() {
-        tracing::warn!(
-            "Matrix channel is configured but this build was compiled without `channel-matrix`; skipping Matrix {}.",
-            _matrix_skip_context
-        );
-    }
-
-    if let Some(ref sig) = config.channels_config.signal {
-        channels.push(ConfiguredChannel {
-            display_name: "Signal",
-            channel: Arc::new(SignalChannel::new(
-                sig.http_url.clone(),
-                sig.account.clone(),
-                sig.group_id.clone(),
-                sig.allowed_from.clone(),
-                sig.ignore_attachments,
-                sig.ignore_stories,
-            )),
-        });
-    }
-
     if let Some(ref wa) = config.channels_config.whatsapp {
-        if wa.is_ambiguous_config() {
-            tracing::warn!(
-                "WhatsApp config has both phone_number_id and session_path set; preferring Cloud API mode. Remove one selector to avoid ambiguity."
-            );
-        }
-        // Runtime negotiation: detect backend type from config
-        match wa.backend_type() {
-            "cloud" => {
-                // Cloud API mode: requires phone_number_id, access_token, verify_token
-                if wa.is_cloud_config() {
-                    channels.push(ConfiguredChannel {
-                        display_name: "WhatsApp",
-                        channel: Arc::new(WhatsAppChannel::new(
-                            wa.access_token.clone().unwrap_or_default(),
-                            wa.phone_number_id.clone().unwrap_or_default(),
-                            wa.verify_token.clone().unwrap_or_default(),
-                            wa.allowed_numbers.clone(),
-                        )),
-                    });
-                } else {
-                    tracing::warn!("WhatsApp Cloud API configured but missing required fields (phone_number_id, access_token, verify_token)");
-                }
-            }
-            "web" => {
-                // Web mode: requires session_path
-                #[cfg(feature = "whatsapp-web")]
-                if wa.is_web_config() {
-                    channels.push(ConfiguredChannel {
-                        display_name: "WhatsApp",
-                        channel: Arc::new(WhatsAppWebChannel::new(
-                            wa.session_path.clone().unwrap_or_default(),
-                            wa.pair_phone.clone(),
-                            wa.pair_code.clone(),
-                            wa.allowed_numbers.clone(),
-                        )),
-                    });
-                } else {
-                    tracing::warn!("WhatsApp Web configured but session_path not set");
-                }
-                #[cfg(not(feature = "whatsapp-web"))]
-                {
-                    tracing::warn!("WhatsApp Web backend requires 'whatsapp-web' feature. Enable with: cargo build --features whatsapp-web");
-                }
-            }
-            _ => {
-                tracing::warn!("WhatsApp config invalid: neither phone_number_id (Cloud API) nor session_path (Web) is set");
-            }
-        }
-    }
-
-    if let Some(ref lq) = config.channels_config.linq {
-        channels.push(ConfiguredChannel {
-            display_name: "Linq",
-            channel: Arc::new(LinqChannel::new(
-                lq.api_token.clone(),
-                lq.from_phone.clone(),
-                lq.allowed_senders.clone(),
-            )),
-        });
-    }
-
-    if let Some(ref wati_cfg) = config.channels_config.wati {
-        channels.push(ConfiguredChannel {
-            display_name: "WATI",
-            channel: Arc::new(WatiChannel::new(
-                wati_cfg.api_token.clone(),
-                wati_cfg.api_url.clone(),
-                wati_cfg.tenant_id.clone(),
-                wati_cfg.allowed_numbers.clone(),
-            )),
-        });
-    }
-
-    if let Some(ref nc) = config.channels_config.nextcloud_talk {
-        channels.push(ConfiguredChannel {
-            display_name: "Nextcloud Talk",
-            channel: Arc::new(NextcloudTalkChannel::new(
-                nc.base_url.clone(),
-                nc.app_token.clone(),
-                nc.allowed_users.clone(),
-            )),
-        });
-    }
-
-    if let Some(ref email_cfg) = config.channels_config.email {
-        channels.push(ConfiguredChannel {
-            display_name: "Email",
-            channel: Arc::new(EmailChannel::new(email_cfg.clone())),
-        });
-    }
-
-    if let Some(ref irc) = config.channels_config.irc {
-        channels.push(ConfiguredChannel {
-            display_name: "IRC",
-            channel: Arc::new(IrcChannel::new(irc::IrcChannelConfig {
-                server: irc.server.clone(),
-                port: irc.port,
-                nickname: irc.nickname.clone(),
-                username: irc.username.clone(),
-                channels: irc.channels.clone(),
-                allowed_users: irc.allowed_users.clone(),
-                server_password: irc.server_password.clone(),
-                nickserv_password: irc.nickserv_password.clone(),
-                sasl_password: irc.sasl_password.clone(),
-                verify_tls: irc.verify_tls.unwrap_or(true),
-            })),
-        });
-    }
-
-    #[cfg(feature = "channel-lark")]
-    if let Some(ref lk) = config.channels_config.lark {
-        if lk.use_feishu {
-            if config.channels_config.feishu.is_some() {
-                tracing::warn!(
-                    "Both [channels_config.feishu] and legacy [channels_config.lark].use_feishu=true are configured; ignoring legacy Feishu fallback in lark."
-                );
-            } else {
-                tracing::warn!(
-                    "Using legacy [channels_config.lark].use_feishu=true compatibility path; prefer [channels_config.feishu]."
-                );
-                channels.push(ConfiguredChannel {
-                    display_name: "Feishu",
-                    channel: Arc::new(LarkChannel::from_config(lk)),
-                });
-            }
-        } else {
+        if wa.is_cloud_config() {
             channels.push(ConfiguredChannel {
-                display_name: "Lark",
-                channel: Arc::new(LarkChannel::from_lark_config(lk)),
+                display_name: "WhatsApp",
+                channel: Arc::new(WhatsAppChannel::new(
+                    wa.access_token.clone().unwrap_or_default(),
+                    wa.phone_number_id.clone().unwrap_or_default(),
+                    wa.verify_token.clone().unwrap_or_default(),
+                    wa.allowed_numbers.clone(),
+                )),
             });
+        } else {
+            tracing::warn!("WhatsApp configured but missing required Cloud API fields (phone_number_id, access_token, verify_token)");
         }
-    }
-
-    #[cfg(feature = "channel-lark")]
-    if let Some(ref fs) = config.channels_config.feishu {
-        channels.push(ConfiguredChannel {
-            display_name: "Feishu",
-            channel: Arc::new(LarkChannel::from_feishu_config(fs)),
-        });
-    }
-
-    #[cfg(not(feature = "channel-lark"))]
-    if config.channels_config.lark.is_some() || config.channels_config.feishu.is_some() {
-        tracing::warn!(
-            "Lark/Feishu channel is configured but this build was compiled without `channel-lark`; skipping Lark/Feishu health check."
-        );
-    }
-
-    if let Some(ref dt) = config.channels_config.dingtalk {
-        channels.push(ConfiguredChannel {
-            display_name: "DingTalk",
-            channel: Arc::new(DingTalkChannel::new(
-                dt.client_id.clone(),
-                dt.client_secret.clone(),
-                dt.allowed_users.clone(),
-            )),
-        });
-    }
-
-    if let Some(ref qq) = config.channels_config.qq {
-        channels.push(ConfiguredChannel {
-            display_name: "QQ",
-            channel: Arc::new(QQChannel::new(
-                qq.app_id.clone(),
-                qq.app_secret.clone(),
-                qq.allowed_users.clone(),
-            )),
-        });
-    }
-
-    if let Some(ref ct) = config.channels_config.clawdtalk {
-        channels.push(ConfiguredChannel {
-            display_name: "ClawdTalk",
-            channel: Arc::new(ClawdTalkChannel::new(ct.clone())),
-        });
     }
 
     channels
@@ -2936,16 +2402,7 @@ fn collect_configured_channels(
 
 /// Run health checks for configured channels.
 pub async fn doctor_channels(config: Config) -> Result<()> {
-    let mut channels = collect_configured_channels(&config, "health check");
-
-    if let Some(ref ns) = config.channels_config.nostr {
-        channels.push(ConfiguredChannel {
-            display_name: "Nostr",
-            channel: Arc::new(
-                NostrChannel::new(&ns.private_key, ns.relays.clone(), &ns.allowed_pubkeys).await?,
-            ),
-        });
-    }
+    let channels = collect_configured_channels(&config, "health check");
 
     if channels.is_empty() {
         println!("No real-time channels configured. Run `zeroclaw onboard` first.");
@@ -2983,10 +2440,6 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         }
     }
 
-    if config.channels_config.webhook.is_some() {
-        println!("  ℹ️  Webhook   check via `zeroclaw gateway` then GET /health");
-    }
-
     println!();
     println!("Summary: {healthy} healthy, {unhealthy} unhealthy, {timeout} timed out");
     Ok(())
@@ -3007,7 +2460,6 @@ pub async fn start_channels(config: Config) -> Result<()> {
             &provider_name,
             config.api_key.clone(),
             config.api_url.clone(),
-            config.reliability.clone(),
             provider_runtime_options.clone(),
         )
         .await?,
@@ -3043,38 +2495,18 @@ pub async fn start_channels(config: Config) -> Result<()> {
     ));
     let model = resolved_default_model(&config);
     let temperature = config.default_temperature;
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
+    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory(
         &config.memory,
-        Some(&config.storage.provider.config),
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
-        (
-            config.composio.api_key.as_deref(),
-            Some(config.composio.entity_id.as_str()),
-        )
-    } else {
-        (None, None)
-    };
-    // Build system prompt from workspace identity files + skills
+    // Build system prompt from workspace identity files
     let workspace = config.workspace_dir.clone();
-    let tools_registry = Arc::new(tools::all_tools_with_runtime(
-        Arc::new(config.clone()),
-        &security,
+    let tools_registry = Arc::new(tools::default_tools_with_runtime(
+        security.clone(),
         runtime,
         Arc::clone(&mem),
-        composio_key,
-        composio_entity_id,
-        &config.browser,
-        &config.http_request,
-        &workspace,
-        &config.agents,
-        config.api_key.as_deref(),
-        &config,
     ));
-
-    let skills = crate::skills::load_skills_with_config(&workspace, &config);
 
     // Collect tool descriptions for the prompt
     let mut tool_descs: Vec<(&str, &str)> = vec![
@@ -3104,18 +2536,6 @@ pub async fn start_channels(config: Config) -> Result<()> {
         ),
     ];
 
-    if config.browser.enabled {
-        tool_descs.push((
-            "browser_open",
-            "Open approved HTTPS URLs in Brave Browser (allowlist-only, no scraping)",
-        ));
-    }
-    if config.composio.enabled {
-        tool_descs.push((
-            "composio",
-            "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover actions, 'list_accounts' to retrieve connected account IDs, 'execute' to run (optionally with connected_account_id), and 'connect' for OAuth.",
-        ));
-    }
     tool_descs.push((
         "schedule",
         "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
@@ -3124,13 +2544,6 @@ pub async fn start_channels(config: Config) -> Result<()> {
         "pushover",
         "Send a Pushover notification to your device. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in .env file.",
     ));
-    if !config.agents.is_empty() {
-        tool_descs.push((
-            "delegate",
-            "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single prompt and returns its response.",
-        ));
-    }
-
     // Filter out tools excluded for non-CLI channels so the system prompt
     // does not advertise them for channel-driven runs.
     let excluded = &config.autonomy.non_cli_excluded_tools;
@@ -3148,39 +2561,20 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &workspace,
         &model,
         &tool_descs,
-        &skills,
-        Some(&config.identity),
         bootstrap_max_chars,
         native_tools,
-        config.skills.prompt_injection_mode,
     );
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
     }
 
-    if !skills.is_empty() {
-        println!(
-            "  🧩 Skills:   {}",
-            skills
-                .iter()
-                .map(|s| s.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-
     // Collect active channels from a shared builder to keep startup and doctor parity.
-    let mut channels: Vec<Arc<dyn Channel>> =
+    let channels: Vec<Arc<dyn Channel>> =
         collect_configured_channels(&config, "runtime startup")
             .into_iter()
             .map(|configured| configured.channel)
             .collect();
 
-    if let Some(ref ns) = config.channels_config.nostr {
-        channels.push(Arc::new(
-            NostrChannel::new(&ns.private_key, ns.relays.clone(), &ns.allowed_pubkeys).await?,
-        ));
-    }
     if channels.is_empty() {
         println!("No channels configured. Run `zeroclaw onboard` to set up channels.");
         return Ok(());
@@ -3190,7 +2584,6 @@ pub async fn start_channels(config: Config) -> Result<()> {
     println!("  🤖 Model:    {model}");
     let effective_backend = memory::effective_memory_backend_name(
         &config.memory.backend,
-        Some(&config.storage.provider.config),
     );
     println!(
         "  🧠 Memory:   {} (auto-save: {})",
@@ -3211,14 +2604,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     crate::health::mark_component_ok("channels");
 
-    let initial_backoff_secs = config
-        .reliability
-        .channel_initial_backoff_secs
-        .max(DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS);
-    let max_backoff_secs = config
-        .reliability
-        .channel_max_backoff_secs
-        .max(DEFAULT_CHANNEL_MAX_BACKOFF_SECS);
+    let initial_backoff_secs = DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS;
+    let max_backoff_secs = DEFAULT_CHANNEL_MAX_BACKOFF_SECS;
 
     // Single message bus — all channels send messages here
     let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(100);
@@ -3249,11 +2636,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     provider_cache_seed.insert(provider_name.clone(), Arc::clone(&provider));
     let message_timeout_secs =
         effective_channel_message_timeout_secs(config.channels_config.message_timeout_secs);
-    let interrupt_on_new_message = config
-        .channels_config
-        .telegram
-        .as_ref()
-        .is_some_and(|tg| tg.interrupt_on_new_message);
+    let interrupt_on_new_message = false;
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
@@ -3273,21 +2656,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
         api_key: config.api_key.clone(),
         api_url: config.api_url.clone(),
-        reliability: Arc::new(config.reliability.clone()),
         provider_runtime_options,
         workspace_dir: Arc::new(config.workspace_dir.clone()),
         message_timeout_secs,
         interrupt_on_new_message,
-        multimodal: config.multimodal.clone(),
-        hooks: if config.hooks.enabled {
-            let mut runner = crate::hooks::HookRunner::new();
-            if config.hooks.builtin.command_logger {
-                runner.register(Box::new(crate::hooks::builtin::CommandLoggerHook::new()));
-            }
-            Some(Arc::new(runner))
-        } else {
-            None
-        },
         non_cli_excluded_tools: Arc::new(config.autonomy.non_cli_excluded_tools.clone()),
     });
 
@@ -3494,10 +2866,7 @@ mod tests {
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             interrupt_on_new_message: false,
-            multimodal: crate::config::MultimodalConfig::default(),
-            hooks: None,
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
@@ -3543,10 +2912,7 @@ mod tests {
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             interrupt_on_new_message: false,
-            multimodal: crate::config::MultimodalConfig::default(),
-            hooks: None,
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
@@ -3595,10 +2961,7 @@ mod tests {
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             interrupt_on_new_message: false,
-            multimodal: crate::config::MultimodalConfig::default(),
-            hooks: None,
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
@@ -4070,14 +3433,11 @@ BTC is currently around $65,000 based on latest tool output."#
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             non_cli_excluded_tools: Arc::new(Vec::new()),
-            multimodal: crate::config::MultimodalConfig::default(),
-            hooks: None,
         });
 
         process_channel_message(
@@ -4129,14 +3489,11 @@ BTC is currently around $65,000 based on latest tool output."#
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             non_cli_excluded_tools: Arc::new(Vec::new()),
-            multimodal: crate::config::MultimodalConfig::default(),
-            hooks: None,
         });
 
         process_channel_message(
@@ -4202,13 +3559,10 @@ BTC is currently around $65,000 based on latest tool output."#
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
-            multimodal: crate::config::MultimodalConfig::default(),
-            hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -4261,13 +3615,10 @@ BTC is currently around $65,000 based on latest tool output."#
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
-            multimodal: crate::config::MultimodalConfig::default(),
-            hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -4292,85 +3643,6 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(sent_messages[0].contains("alias-tag flow resolved"));
         assert!(!sent_messages[0].contains("<toolcall>"));
         assert!(!sent_messages[0].contains("mock_price"));
-    }
-
-    #[tokio::test]
-    async fn process_channel_message_handles_models_command_without_llm_call() {
-        let channel_impl = Arc::new(TelegramRecordingChannel::default());
-        let channel: Arc<dyn Channel> = channel_impl.clone();
-
-        let mut channels_by_name = HashMap::new();
-        channels_by_name.insert(channel.name().to_string(), channel);
-
-        let default_provider_impl = Arc::new(ModelCaptureProvider::default());
-        let default_provider: Arc<dyn Provider> = default_provider_impl.clone();
-        let fallback_provider_impl = Arc::new(ModelCaptureProvider::default());
-        let fallback_provider: Arc<dyn Provider> = fallback_provider_impl.clone();
-
-        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
-        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&default_provider));
-        provider_cache_seed.insert("openrouter".to_string(), fallback_provider);
-
-        let runtime_ctx = Arc::new(ChannelRuntimeContext {
-            channels_by_name: Arc::new(channels_by_name),
-            provider: Arc::clone(&default_provider),
-            default_provider: Arc::new("test-provider".to_string()),
-            memory: Arc::new(NoopMemory),
-            tools_registry: Arc::new(vec![]),
-            observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
-            model: Arc::new("default-model".to_string()),
-            temperature: 0.0,
-            auto_save_memory: false,
-            max_tool_iterations: 5,
-            min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
-            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
-            route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
-            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
-            workspace_dir: Arc::new(std::env::temp_dir()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: false,
-            multimodal: crate::config::MultimodalConfig::default(),
-            hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
-        });
-
-        process_channel_message(
-            runtime_ctx.clone(),
-            traits::ChannelMessage {
-                id: "msg-cmd-1".to_string(),
-                sender: "alice".to_string(),
-                reply_target: "chat-1".to_string(),
-                content: "/models openrouter".to_string(),
-                channel: "telegram".to_string(),
-                timestamp: 1,
-                thread_ts: None,
-            },
-            CancellationToken::new(),
-        )
-        .await;
-
-        let sent = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent.len(), 1);
-        assert!(sent[0].contains("Provider switched to `openrouter`"));
-
-        let route_key = "telegram_alice";
-        let route = runtime_ctx
-            .route_overrides
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(route_key)
-            .cloned()
-            .expect("route should be stored for sender");
-        assert_eq!(route.provider, "openrouter");
-        assert_eq!(route.model, "default-model");
-
-        assert_eq!(default_provider_impl.call_count.load(Ordering::SeqCst), 0);
-        assert_eq!(fallback_provider_impl.call_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -4418,13 +3690,10 @@ BTC is currently around $65,000 based on latest tool output."#
             route_overrides: Arc::new(Mutex::new(route_overrides)),
             api_key: None,
             api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
-            multimodal: crate::config::MultimodalConfig::default(),
-            hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -4489,13 +3758,10 @@ BTC is currently around $65,000 based on latest tool output."#
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
-            multimodal: crate::config::MultimodalConfig::default(),
-            hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -4547,7 +3813,6 @@ BTC is currently around $65,000 based on latest tool output."#
                         temperature: 0.5,
                         api_key: None,
                         api_url: None,
-                        reliability: crate::config::ReliabilityConfig::default(),
                     },
                     last_applied_stamp: None,
                 },
@@ -4572,7 +3837,6 @@ BTC is currently around $65,000 based on latest tool output."#
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions {
                 zeroclaw_dir: Some(temp.path().to_path_buf()),
                 ..providers::ProviderRuntimeOptions::default()
@@ -4580,8 +3844,6 @@ BTC is currently around $65,000 based on latest tool output."#
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
-            multimodal: crate::config::MultimodalConfig::default(),
-            hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -4646,13 +3908,10 @@ BTC is currently around $65,000 based on latest tool output."#
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
-            multimodal: crate::config::MultimodalConfig::default(),
-            hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -4706,13 +3965,10 @@ BTC is currently around $65,000 based on latest tool output."#
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
-            multimodal: crate::config::MultimodalConfig::default(),
-            hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -4877,13 +4133,10 @@ BTC is currently around $65,000 based on latest tool output."#
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
-            multimodal: crate::config::MultimodalConfig::default(),
-            hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -4957,13 +4210,10 @@ BTC is currently around $65,000 based on latest tool output."#
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: true,
-            multimodal: crate::config::MultimodalConfig::default(),
-            hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -5049,13 +4299,10 @@ BTC is currently around $65,000 based on latest tool output."#
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: true,
-            multimodal: crate::config::MultimodalConfig::default(),
-            hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -5123,13 +4370,10 @@ BTC is currently around $65,000 based on latest tool output."#
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
-            multimodal: crate::config::MultimodalConfig::default(),
-            hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -5182,13 +4426,10 @@ BTC is currently around $65,000 based on latest tool output."#
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
-            multimodal: crate::config::MultimodalConfig::default(),
-            hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -5229,7 +4470,7 @@ BTC is currently around $65,000 based on latest tool output."#
     fn prompt_contains_all_sections() {
         let ws = make_workspace();
         let tools = vec![("shell", "Run commands"), ("file_read", "Read files")];
-        let prompt = build_system_prompt(ws.path(), "test-model", &tools, &[], None, None);
+        let prompt = build_system_prompt(ws.path(), "test-model", &tools, None);
 
         // Section headers
         assert!(prompt.contains("## Tools"), "missing Tools section");
@@ -5253,7 +4494,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ("shell", "Run commands"),
             ("memory_recall", "Search memory"),
         ];
-        let prompt = build_system_prompt(ws.path(), "gpt-4o", &tools, &[], None, None);
+        let prompt = build_system_prompt(ws.path(), "gpt-4o", &tools, None);
 
         assert!(prompt.contains("**shell**"));
         assert!(prompt.contains("Run commands"));
@@ -5264,7 +4505,7 @@ BTC is currently around $65,000 based on latest tool output."#
     fn prompt_includes_single_tool_protocol_block_after_append() {
         let ws = make_workspace();
         let tools = vec![("shell", "Run commands")];
-        let mut prompt = build_system_prompt(ws.path(), "gpt-4o", &tools, &[], None, None);
+        let mut prompt = build_system_prompt(ws.path(), "gpt-4o", &tools, None);
 
         assert!(
             !prompt.contains("## Tool Use Protocol"),
@@ -5283,7 +4524,7 @@ BTC is currently around $65,000 based on latest tool output."#
     #[test]
     fn prompt_injects_safety() {
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], None);
 
         assert!(prompt.contains("Do not exfiltrate private data"));
         assert!(prompt.contains("Do not run destructive commands"));
@@ -5293,7 +4534,7 @@ BTC is currently around $65,000 based on latest tool output."#
     #[test]
     fn prompt_injects_workspace_files() {
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], None);
 
         assert!(prompt.contains("### SOUL.md"), "missing SOUL.md header");
         assert!(prompt.contains("Be helpful"), "missing SOUL content");
@@ -5320,7 +4561,7 @@ BTC is currently around $65,000 based on latest tool output."#
     fn prompt_missing_file_markers() {
         let tmp = TempDir::new().unwrap();
         // Empty workspace — no files at all
-        let prompt = build_system_prompt(tmp.path(), "model", &[], &[], None, None);
+        let prompt = build_system_prompt(tmp.path(), "model", &[], None);
 
         assert!(prompt.contains("[File not found: SOUL.md]"));
         assert!(prompt.contains("[File not found: AGENTS.md]"));
@@ -5331,7 +4572,7 @@ BTC is currently around $65,000 based on latest tool output."#
     fn prompt_bootstrap_only_if_exists() {
         let ws = make_workspace();
         // No BOOTSTRAP.md — should not appear
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], None);
         assert!(
             !prompt.contains("### BOOTSTRAP.md"),
             "BOOTSTRAP.md should not appear when missing"
@@ -5339,7 +4580,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         // Create BOOTSTRAP.md — should appear
         std::fs::write(ws.path().join("BOOTSTRAP.md"), "# Bootstrap\nFirst run.").unwrap();
-        let prompt2 = build_system_prompt(ws.path(), "model", &[], &[], None, None);
+        let prompt2 = build_system_prompt(ws.path(), "model", &[], None);
         assert!(
             prompt2.contains("### BOOTSTRAP.md"),
             "BOOTSTRAP.md should appear when present"
@@ -5359,7 +4600,7 @@ BTC is currently around $65,000 based on latest tool output."#
         )
         .unwrap();
 
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], None);
 
         // Daily notes should NOT be in the system prompt (on-demand via tools)
         assert!(
@@ -5375,121 +4616,11 @@ BTC is currently around $65,000 based on latest tool output."#
     #[test]
     fn prompt_runtime_metadata() {
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "claude-sonnet-4", &[], &[], None, None);
+        let prompt = build_system_prompt(ws.path(), "claude-sonnet-4", &[], None);
 
         assert!(prompt.contains("Model: claude-sonnet-4"));
         assert!(prompt.contains(&format!("OS: {}", std::env::consts::OS)));
         assert!(prompt.contains("Host:"));
-    }
-
-    #[test]
-    fn prompt_skills_include_instructions_and_tools() {
-        let ws = make_workspace();
-        let skills = vec![crate::skills::Skill {
-            name: "code-review".into(),
-            description: "Review code for bugs".into(),
-            version: "1.0.0".into(),
-            author: None,
-            tags: vec![],
-            tools: vec![crate::skills::SkillTool {
-                name: "lint".into(),
-                description: "Run static checks".into(),
-                kind: "shell".into(),
-                command: "cargo clippy".into(),
-                args: HashMap::new(),
-            }],
-            prompts: vec!["Always run cargo test before final response.".into()],
-            location: None,
-        }];
-
-        let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None, None);
-
-        assert!(prompt.contains("<available_skills>"), "missing skills XML");
-        assert!(prompt.contains("<name>code-review</name>"));
-        assert!(prompt.contains("<description>Review code for bugs</description>"));
-        assert!(prompt.contains("SKILL.md</location>"));
-        assert!(prompt.contains("<instructions>"));
-        assert!(prompt
-            .contains("<instruction>Always run cargo test before final response.</instruction>"));
-        assert!(prompt.contains("<tools>"));
-        assert!(prompt.contains("<name>lint</name>"));
-        assert!(prompt.contains("<kind>shell</kind>"));
-        assert!(!prompt.contains("loaded on demand"));
-    }
-
-    #[test]
-    fn prompt_skills_compact_mode_omits_instructions_and_tools() {
-        let ws = make_workspace();
-        let skills = vec![crate::skills::Skill {
-            name: "code-review".into(),
-            description: "Review code for bugs".into(),
-            version: "1.0.0".into(),
-            author: None,
-            tags: vec![],
-            tools: vec![crate::skills::SkillTool {
-                name: "lint".into(),
-                description: "Run static checks".into(),
-                kind: "shell".into(),
-                command: "cargo clippy".into(),
-                args: HashMap::new(),
-            }],
-            prompts: vec!["Always run cargo test before final response.".into()],
-            location: None,
-        }];
-
-        let prompt = build_system_prompt_with_mode(
-            ws.path(),
-            "model",
-            &[],
-            &skills,
-            None,
-            None,
-            false,
-            crate::config::SkillsPromptInjectionMode::Compact,
-        );
-
-        assert!(prompt.contains("<available_skills>"), "missing skills XML");
-        assert!(prompt.contains("<name>code-review</name>"));
-        assert!(prompt.contains("<location>skills/code-review/SKILL.md</location>"));
-        assert!(prompt.contains("loaded on demand"));
-        assert!(!prompt.contains("<instructions>"));
-        assert!(!prompt
-            .contains("<instruction>Always run cargo test before final response.</instruction>"));
-        assert!(!prompt.contains("<tools>"));
-    }
-
-    #[test]
-    fn prompt_skills_escape_reserved_xml_chars() {
-        let ws = make_workspace();
-        let skills = vec![crate::skills::Skill {
-            name: "code<review>&".into(),
-            description: "Review \"unsafe\" and 'risky' bits".into(),
-            version: "1.0.0".into(),
-            author: None,
-            tags: vec![],
-            tools: vec![crate::skills::SkillTool {
-                name: "run\"linter\"".into(),
-                description: "Run <lint> & report".into(),
-                kind: "shell&exec".into(),
-                command: "cargo clippy".into(),
-                args: HashMap::new(),
-            }],
-            prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
-            location: None,
-        }];
-
-        let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None, None);
-
-        assert!(prompt.contains("<name>code&lt;review&gt;&amp;</name>"));
-        assert!(prompt.contains(
-            "<description>Review &quot;unsafe&quot; and &apos;risky&apos; bits</description>"
-        ));
-        assert!(prompt.contains("<name>run&quot;linter&quot;</name>"));
-        assert!(prompt.contains("<description>Run &lt;lint&gt; &amp; report</description>"));
-        assert!(prompt.contains("<kind>shell&amp;exec</kind>"));
-        assert!(prompt.contains(
-            "<instruction>Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;</instruction>"
-        ));
     }
 
     #[test]
@@ -5499,7 +4630,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let big_content = "x".repeat(BOOTSTRAP_MAX_CHARS + 1000);
         std::fs::write(ws.path().join("AGENTS.md"), &big_content).unwrap();
 
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], None);
 
         assert!(
             prompt.contains("truncated at"),
@@ -5516,7 +4647,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let ws = make_workspace();
         std::fs::write(ws.path().join("TOOLS.md"), "").unwrap();
 
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], None);
 
         // Empty file should not produce a header
         assert!(
@@ -5544,7 +4675,7 @@ BTC is currently around $65,000 based on latest tool output."#
     #[test]
     fn prompt_contains_channel_capabilities() {
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], None);
 
         assert!(
             prompt.contains("## Channel Capabilities"),
@@ -5563,7 +4694,7 @@ BTC is currently around $65,000 based on latest tool output."#
     #[test]
     fn prompt_workspace_path() {
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], None);
 
         assert!(prompt.contains(&format!("Working directory: `{}`", ws.path().display())));
     }
@@ -5698,13 +4829,10 @@ BTC is currently around $65,000 based on latest tool output."#
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
-            multimodal: crate::config::MultimodalConfig::default(),
-            hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -5783,13 +4911,10 @@ BTC is currently around $65,000 based on latest tool output."#
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
             api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
-            multimodal: crate::config::MultimodalConfig::default(),
-            hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
@@ -5829,91 +4954,6 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(turns[0].role, "user");
         assert_eq!(turns[0].content, "hello");
         assert!(!turns[0].content.contains("[Memory context]"));
-    }
-
-    #[tokio::test]
-    async fn process_channel_message_telegram_keeps_system_instruction_at_top_only() {
-        let channel_impl = Arc::new(TelegramRecordingChannel::default());
-        let channel: Arc<dyn Channel> = channel_impl.clone();
-
-        let mut channels_by_name = HashMap::new();
-        channels_by_name.insert(channel.name().to_string(), channel);
-
-        let provider_impl = Arc::new(HistoryCaptureProvider::default());
-        let mut histories = HashMap::new();
-        histories.insert(
-            "telegram_alice".to_string(),
-            vec![
-                ChatMessage::assistant("stale assistant"),
-                ChatMessage::user("earlier user question"),
-                ChatMessage::assistant("earlier assistant reply"),
-            ],
-        );
-
-        let runtime_ctx = Arc::new(ChannelRuntimeContext {
-            channels_by_name: Arc::new(channels_by_name),
-            provider: provider_impl.clone(),
-            default_provider: Arc::new("test-provider".to_string()),
-            memory: Arc::new(NoopMemory),
-            tools_registry: Arc::new(vec![]),
-            observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
-            model: Arc::new("test-model".to_string()),
-            temperature: 0.0,
-            auto_save_memory: false,
-            max_tool_iterations: 5,
-            min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(histories)),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
-            route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
-            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
-            workspace_dir: Arc::new(std::env::temp_dir()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: false,
-            multimodal: crate::config::MultimodalConfig::default(),
-            hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
-        });
-
-        process_channel_message(
-            runtime_ctx.clone(),
-            traits::ChannelMessage {
-                id: "tg-msg-1".to_string(),
-                sender: "alice".to_string(),
-                reply_target: "chat-telegram".to_string(),
-                content: "hello".to_string(),
-                channel: "telegram".to_string(),
-                timestamp: 1,
-                thread_ts: None,
-            },
-            CancellationToken::new(),
-        )
-        .await;
-
-        let calls = provider_impl
-            .calls
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].len(), 4);
-
-        let roles = calls[0]
-            .iter()
-            .map(|(role, _)| role.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(roles, vec!["system", "user", "assistant", "user"]);
-        assert!(
-            calls[0][0].1.contains("When responding on Telegram:"),
-            "telegram channel instructions should be embedded into the system prompt"
-        );
-        assert!(
-            calls[0][0].1.contains("For media attachments use markers:"),
-            "telegram media marker guidance should live in the system prompt"
-        );
-        assert!(!calls[0].iter().skip(1).any(|(role, _)| role == "system"));
     }
 
     #[test]
@@ -6012,153 +5052,6 @@ This is an example JSON object for profile settings."#;
     // ── AIEOS Identity Tests (Issue #168) ─────────────────────────
 
     #[test]
-    fn aieos_identity_from_file() {
-        use crate::config::IdentityConfig;
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().unwrap();
-        let identity_path = tmp.path().join("aieos_identity.json");
-
-        // Write AIEOS identity file
-        let aieos_json = r#"{
-            "identity": {
-                "names": {"first": "Nova", "nickname": "Nov"},
-                "bio": "A helpful AI assistant.",
-                "origin": "Silicon Valley"
-            },
-            "psychology": {
-                "mbti": "INTJ",
-                "moral_compass": ["Be helpful", "Do no harm"]
-            },
-            "linguistics": {
-                "style": "concise",
-                "formality": "casual"
-            }
-        }"#;
-        std::fs::write(&identity_path, aieos_json).unwrap();
-
-        // Create identity config pointing to the file
-        let config = IdentityConfig {
-            format: "aieos".into(),
-            aieos_path: Some("aieos_identity.json".into()),
-            aieos_inline: None,
-        };
-
-        let prompt = build_system_prompt(tmp.path(), "model", &[], &[], Some(&config), None);
-
-        // Should contain AIEOS sections
-        assert!(prompt.contains("## Identity"));
-        assert!(prompt.contains("**Name:** Nova"));
-        assert!(prompt.contains("**Nickname:** Nov"));
-        assert!(prompt.contains("**Bio:** A helpful AI assistant."));
-        assert!(prompt.contains("**Origin:** Silicon Valley"));
-
-        assert!(prompt.contains("## Personality"));
-        assert!(prompt.contains("**MBTI:** INTJ"));
-        assert!(prompt.contains("**Moral Compass:**"));
-        assert!(prompt.contains("- Be helpful"));
-
-        assert!(prompt.contains("## Communication Style"));
-        assert!(prompt.contains("**Style:** concise"));
-        assert!(prompt.contains("**Formality Level:** casual"));
-
-        // Should NOT contain OpenClaw bootstrap file headers
-        assert!(!prompt.contains("### SOUL.md"));
-        assert!(!prompt.contains("### IDENTITY.md"));
-        assert!(!prompt.contains("[File not found"));
-    }
-
-    #[test]
-    fn aieos_identity_from_inline() {
-        use crate::config::IdentityConfig;
-
-        let config = IdentityConfig {
-            format: "aieos".into(),
-            aieos_path: None,
-            aieos_inline: Some(r#"{"identity":{"names":{"first":"Claw"}}}"#.into()),
-        };
-
-        let prompt = build_system_prompt(
-            std::env::temp_dir().as_path(),
-            "model",
-            &[],
-            &[],
-            Some(&config),
-            None,
-        );
-
-        assert!(prompt.contains("**Name:** Claw"));
-        assert!(prompt.contains("## Identity"));
-    }
-
-    #[test]
-    fn aieos_fallback_to_openclaw_on_parse_error() {
-        use crate::config::IdentityConfig;
-
-        let config = IdentityConfig {
-            format: "aieos".into(),
-            aieos_path: Some("nonexistent.json".into()),
-            aieos_inline: None,
-        };
-
-        let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config), None);
-
-        // Should fall back to OpenClaw format when AIEOS file is not found
-        // (Error is logged to stderr with filename, not included in prompt)
-        assert!(prompt.contains("### SOUL.md"));
-    }
-
-    #[test]
-    fn aieos_empty_uses_openclaw() {
-        use crate::config::IdentityConfig;
-
-        // Format is "aieos" but neither path nor inline is set
-        let config = IdentityConfig {
-            format: "aieos".into(),
-            aieos_path: None,
-            aieos_inline: None,
-        };
-
-        let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config), None);
-
-        // Should use OpenClaw format (not configured for AIEOS)
-        assert!(prompt.contains("### SOUL.md"));
-        assert!(prompt.contains("Be helpful"));
-    }
-
-    #[test]
-    fn openclaw_format_uses_bootstrap_files() {
-        use crate::config::IdentityConfig;
-
-        let config = IdentityConfig {
-            format: "openclaw".into(),
-            aieos_path: Some("identity.json".into()),
-            aieos_inline: None,
-        };
-
-        let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config), None);
-
-        // Should use OpenClaw format even if aieos_path is set
-        assert!(prompt.contains("### SOUL.md"));
-        assert!(prompt.contains("Be helpful"));
-        assert!(!prompt.contains("## Identity"));
-    }
-
-    #[test]
-    fn none_identity_config_uses_openclaw() {
-        let ws = make_workspace();
-        // Pass None for identity config
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
-
-        // Should use OpenClaw format
-        assert!(prompt.contains("### SOUL.md"));
-        assert!(prompt.contains("Be helpful"));
-    }
-
-    #[test]
     fn classify_health_ok_true() {
         let state = classify_health_result(&Ok(true));
         assert_eq!(state, ChannelHealthState::Healthy);
@@ -6179,28 +5072,6 @@ This is an example JSON object for profile settings."#;
         .await;
         let state = classify_health_result(&result);
         assert_eq!(state, ChannelHealthState::Timeout);
-    }
-
-    #[test]
-    fn collect_configured_channels_includes_mattermost_when_configured() {
-        let mut config = Config::default();
-        config.channels_config.mattermost = Some(crate::config::schema::MattermostConfig {
-            url: "https://mattermost.example.com".to_string(),
-            bot_token: "test-token".to_string(),
-            channel_id: Some("channel-1".to_string()),
-            allowed_users: vec![],
-            thread_replies: Some(true),
-            mention_only: Some(false),
-        });
-
-        let channels = collect_configured_channels(&config, "test");
-
-        assert!(channels
-            .iter()
-            .any(|entry| entry.display_name == "Mattermost"));
-        assert!(channels
-            .iter()
-            .any(|entry| entry.channel.name() == "mattermost"));
     }
 
     struct AlwaysFailChannel {
@@ -6385,173 +5256,4 @@ This is an example JSON object for profile settings."#;
     }
 
     // ── E2E: photo [IMAGE:] marker rejected by non-vision provider ───
-
-    /// End-to-end test: a photo attachment message (containing `[IMAGE:]`
-    /// marker) sent through `process_channel_message` with a non-vision
-    /// provider must produce a `"⚠️ Error: …does not support vision"` reply
-    /// on the recording channel — no real Telegram or LLM API required.
-    #[tokio::test]
-    async fn e2e_photo_attachment_rejected_by_non_vision_provider() {
-        let channel_impl = Arc::new(RecordingChannel::default());
-        let channel: Arc<dyn Channel> = channel_impl.clone();
-
-        let mut channels_by_name = HashMap::new();
-        channels_by_name.insert(channel.name().to_string(), channel);
-
-        // DummyProvider has default capabilities (vision: false).
-        let runtime_ctx = Arc::new(ChannelRuntimeContext {
-            channels_by_name: Arc::new(channels_by_name),
-            provider: Arc::new(DummyProvider),
-            default_provider: Arc::new("dummy".to_string()),
-            memory: Arc::new(NoopMemory),
-            tools_registry: Arc::new(vec![]),
-            observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("You are a helpful assistant.".to_string()),
-            model: Arc::new("test-model".to_string()),
-            temperature: 0.0,
-            auto_save_memory: false,
-            max_tool_iterations: 5,
-            min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
-            route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
-            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
-            workspace_dir: Arc::new(std::env::temp_dir()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: false,
-            multimodal: crate::config::MultimodalConfig::default(),
-            hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
-        });
-
-        // Simulate a photo attachment message with [IMAGE:] marker.
-        process_channel_message(
-            runtime_ctx,
-            traits::ChannelMessage {
-                id: "msg-photo-1".to_string(),
-                sender: "zeroclaw_user".to_string(),
-                reply_target: "chat-photo".to_string(),
-                content: "[IMAGE:/tmp/workspace/photo_99_1.jpg]\n\nWhat is this?".to_string(),
-                channel: "test-channel".to_string(),
-                timestamp: 1,
-                thread_ts: None,
-            },
-            CancellationToken::new(),
-        )
-        .await;
-
-        let sent = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent.len(), 1, "expected exactly one reply message");
-        assert!(
-            sent[0].contains("does not support vision"),
-            "reply must mention vision capability error, got: {}",
-            sent[0]
-        );
-        assert!(
-            sent[0].contains("⚠️ Error"),
-            "reply must start with error prefix, got: {}",
-            sent[0]
-        );
-    }
-
-    #[tokio::test]
-    async fn e2e_failed_vision_turn_does_not_poison_follow_up_text_turn() {
-        let channel_impl = Arc::new(RecordingChannel::default());
-        let channel: Arc<dyn Channel> = channel_impl.clone();
-
-        let mut channels_by_name = HashMap::new();
-        channels_by_name.insert(channel.name().to_string(), channel);
-
-        let runtime_ctx = Arc::new(ChannelRuntimeContext {
-            channels_by_name: Arc::new(channels_by_name),
-            provider: Arc::new(DummyProvider),
-            default_provider: Arc::new("dummy".to_string()),
-            memory: Arc::new(NoopMemory),
-            tools_registry: Arc::new(vec![]),
-            observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("You are a helpful assistant.".to_string()),
-            model: Arc::new("test-model".to_string()),
-            temperature: 0.0,
-            auto_save_memory: false,
-            max_tool_iterations: 5,
-            min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
-            route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
-            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
-            workspace_dir: Arc::new(std::env::temp_dir()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: false,
-            multimodal: crate::config::MultimodalConfig::default(),
-            hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
-        });
-
-        process_channel_message(
-            Arc::clone(&runtime_ctx),
-            traits::ChannelMessage {
-                id: "msg-photo-1".to_string(),
-                sender: "zeroclaw_user".to_string(),
-                reply_target: "chat-photo".to_string(),
-                content: "[IMAGE:/tmp/workspace/photo_99_1.jpg]\n\nWhat is this?".to_string(),
-                channel: "test-channel".to_string(),
-                timestamp: 1,
-                thread_ts: None,
-            },
-            CancellationToken::new(),
-        )
-        .await;
-
-        process_channel_message(
-            Arc::clone(&runtime_ctx),
-            traits::ChannelMessage {
-                id: "msg-text-2".to_string(),
-                sender: "zeroclaw_user".to_string(),
-                reply_target: "chat-photo".to_string(),
-                content: "What is WAL?".to_string(),
-                channel: "test-channel".to_string(),
-                timestamp: 2,
-                thread_ts: None,
-            },
-            CancellationToken::new(),
-        )
-        .await;
-
-        let sent = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent.len(), 2, "expected one error and one successful reply");
-        assert!(
-            sent[0].contains("does not support vision"),
-            "first reply must mention vision capability error, got: {}",
-            sent[0]
-        );
-        assert!(
-            sent[1].ends_with(":ok"),
-            "second reply should succeed for text-only turn, got: {}",
-            sent[1]
-        );
-        drop(sent);
-
-        let histories = runtime_ctx
-            .conversation_histories
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let turns = histories
-            .get("test-channel_zeroclaw_user")
-            .expect("history should exist for sender");
-        assert_eq!(turns.len(), 2);
-        assert_eq!(turns[0].role, "user");
-        assert_eq!(turns[0].content, "What is WAL?");
-        assert_eq!(turns[1].role, "assistant");
-        assert_eq!(turns[1].content, "ok");
-        assert!(
-            turns.iter().all(|turn| !turn.content.contains("[IMAGE:")),
-            "failed vision turn must not persist image marker content"
-        );
-    }
 }

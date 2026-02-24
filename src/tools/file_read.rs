@@ -216,19 +216,6 @@ impl Tool for FileReadTool {
     }
 }
 
-#[cfg(feature = "rag-pdf")]
-fn try_extract_pdf_text(bytes: &[u8]) -> Option<String> {
-    if bytes.len() < 5 || &bytes[..5] != b"%PDF-" {
-        return None;
-    }
-    let text = pdf_extract::extract_text_from_mem(bytes).ok()?;
-    if text.trim().is_empty() {
-        return None;
-    }
-    Some(text)
-}
-
-#[cfg(not(feature = "rag-pdf"))]
 fn try_extract_pdf_text(_bytes: &[u8]) -> Option<String> {
     None
 }
@@ -963,8 +950,8 @@ mod tests {
     async fn e2e_live_file_read_pdf() {
         use crate::agent::agent::Agent;
         use crate::agent::dispatcher::XmlToolDispatcher;
-        use crate::providers::openai_codex::OpenAiCodexProvider;
-        use crate::providers::{Provider, ProviderRuntimeOptions};
+        use crate::providers::openai::OpenAiProvider;
+        use crate::providers::Provider;
         use e2e_helpers::*;
 
         // ── Set up workspace with PDF fixture ──
@@ -986,8 +973,8 @@ mod tests {
         });
         let file_read_tool: Box<dyn Tool> = Box::new(FileReadTool::new(security));
 
-        // ── Real provider (OpenAI Codex uses XML tool dispatch) ──
-        let provider = OpenAiCodexProvider::new(&ProviderRuntimeOptions::default());
+        // ── Real provider (OpenAI) ──
+        let provider = OpenAiProvider::with_base_url(None, None);
 
         let mut agent = Agent::builder()
             .provider(Box::new(provider) as Box<dyn Provider>)

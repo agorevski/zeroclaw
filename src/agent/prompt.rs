@@ -1,6 +1,3 @@
-use crate::config::IdentityConfig;
-use crate::identity;
-use crate::skills::Skill;
 use crate::tools::Tool;
 use anyhow::Result;
 use chrono::Local;
@@ -13,9 +10,6 @@ pub struct PromptContext<'a> {
     pub workspace_dir: &'a Path,
     pub model_name: &'a str,
     pub tools: &'a [Box<dyn Tool>],
-    pub skills: &'a [Skill],
-    pub skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
-    pub identity_config: Option<&'a IdentityConfig>,
     pub dispatcher_instructions: &'a str,
 }
 
@@ -36,7 +30,6 @@ impl SystemPromptBuilder {
                 Box::new(IdentitySection),
                 Box::new(ToolsSection),
                 Box::new(SafetySection),
-                Box::new(SkillsSection),
                 Box::new(WorkspaceSection),
                 Box::new(DateTimeSection),
                 Box::new(RuntimeSection),
@@ -66,7 +59,6 @@ impl SystemPromptBuilder {
 pub struct IdentitySection;
 pub struct ToolsSection;
 pub struct SafetySection;
-pub struct SkillsSection;
 pub struct WorkspaceSection;
 pub struct RuntimeSection;
 pub struct DateTimeSection;
@@ -78,25 +70,9 @@ impl PromptSection for IdentitySection {
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
         let mut prompt = String::from("## Project Context\n\n");
-        let mut has_aieos = false;
-        if let Some(config) = ctx.identity_config {
-            if identity::is_aieos_configured(config) {
-                if let Ok(Some(aieos)) = identity::load_aieos_identity(config, ctx.workspace_dir) {
-                    let rendered = identity::aieos_to_system_prompt(&aieos);
-                    if !rendered.is_empty() {
-                        prompt.push_str(&rendered);
-                        prompt.push_str("\n\n");
-                        has_aieos = true;
-                    }
-                }
-            }
-        }
-
-        if !has_aieos {
-            prompt.push_str(
-                "The following workspace files define your identity, behavior, and context.\n\n",
-            );
-        }
+        prompt.push_str(
+            "The following workspace files define your identity, behavior, and context.\n\n",
+        );
         for file in [
             "AGENTS.md",
             "SOUL.md",
@@ -145,20 +121,6 @@ impl PromptSection for SafetySection {
 
     fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
         Ok("## Safety\n\n- Do not exfiltrate private data.\n- Do not run destructive commands without asking.\n- Do not bypass oversight or approval mechanisms.\n- Prefer `trash` over `rm`.\n- When in doubt, ask before acting externally.".into())
-    }
-}
-
-impl PromptSection for SkillsSection {
-    fn name(&self) -> &str {
-        "skills"
-    }
-
-    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
-        Ok(crate::skills::skills_to_prompt_with_mode(
-            ctx.skills,
-            ctx.workspace_dir,
-            ctx.skills_prompt_mode,
-        ))
     }
 }
 
@@ -275,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_section_with_aieos_includes_workspace_files() {
+    fn identity_section_includes_workspace_files() {
         let workspace =
             std::env::temp_dir().join(format!("zeroclaw_prompt_test_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&workspace).unwrap();
@@ -285,20 +247,11 @@ mod tests {
         )
         .unwrap();
 
-        let identity_config = crate::config::IdentityConfig {
-            format: "aieos".into(),
-            aieos_path: None,
-            aieos_inline: Some(r#"{"identity":{"names":{"first":"Nova"}}}"#.into()),
-        };
-
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
             workspace_dir: &workspace,
             model_name: "test-model",
             tools: &tools,
-            skills: &[],
-            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
-            identity_config: Some(&identity_config),
             dispatcher_instructions: "",
         };
 
@@ -306,12 +259,8 @@ mod tests {
         let output = section.build(&ctx).unwrap();
 
         assert!(
-            output.contains("Nova"),
-            "AIEOS identity should be present in prompt"
-        );
-        assert!(
             output.contains("AGENTS_MD_LOADED"),
-            "AGENTS.md content should be present even when AIEOS is configured"
+            "AGENTS.md content should be present in prompt"
         );
 
         let _ = std::fs::remove_dir_all(workspace);
@@ -324,9 +273,6 @@ mod tests {
             workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
             tools: &tools,
-            skills: &[],
-            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
-            identity_config: None,
             dispatcher_instructions: "instr",
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -336,91 +282,12 @@ mod tests {
     }
 
     #[test]
-    fn skills_section_includes_instructions_and_tools() {
-        let tools: Vec<Box<dyn Tool>> = vec![];
-        let skills = vec![crate::skills::Skill {
-            name: "deploy".into(),
-            description: "Release safely".into(),
-            version: "1.0.0".into(),
-            author: None,
-            tags: vec![],
-            tools: vec![crate::skills::SkillTool {
-                name: "release_checklist".into(),
-                description: "Validate release readiness".into(),
-                kind: "shell".into(),
-                command: "echo ok".into(),
-                args: std::collections::HashMap::new(),
-            }],
-            prompts: vec!["Run smoke tests before deploy.".into()],
-            location: None,
-        }];
-
-        let ctx = PromptContext {
-            workspace_dir: Path::new("/tmp"),
-            model_name: "test-model",
-            tools: &tools,
-            skills: &skills,
-            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
-            identity_config: None,
-            dispatcher_instructions: "",
-        };
-
-        let output = SkillsSection.build(&ctx).unwrap();
-        assert!(output.contains("<available_skills>"));
-        assert!(output.contains("<name>deploy</name>"));
-        assert!(output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
-        assert!(output.contains("<name>release_checklist</name>"));
-        assert!(output.contains("<kind>shell</kind>"));
-    }
-
-    #[test]
-    fn skills_section_compact_mode_omits_instructions_and_tools() {
-        let tools: Vec<Box<dyn Tool>> = vec![];
-        let skills = vec![crate::skills::Skill {
-            name: "deploy".into(),
-            description: "Release safely".into(),
-            version: "1.0.0".into(),
-            author: None,
-            tags: vec![],
-            tools: vec![crate::skills::SkillTool {
-                name: "release_checklist".into(),
-                description: "Validate release readiness".into(),
-                kind: "shell".into(),
-                command: "echo ok".into(),
-                args: std::collections::HashMap::new(),
-            }],
-            prompts: vec!["Run smoke tests before deploy.".into()],
-            location: Some(Path::new("/tmp/workspace/skills/deploy/SKILL.md").to_path_buf()),
-        }];
-
-        let ctx = PromptContext {
-            workspace_dir: Path::new("/tmp/workspace"),
-            model_name: "test-model",
-            tools: &tools,
-            skills: &skills,
-            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Compact,
-            identity_config: None,
-            dispatcher_instructions: "",
-        };
-
-        let output = SkillsSection.build(&ctx).unwrap();
-        assert!(output.contains("<available_skills>"));
-        assert!(output.contains("<name>deploy</name>"));
-        assert!(output.contains("<location>skills/deploy/SKILL.md</location>"));
-        assert!(!output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
-        assert!(!output.contains("<tools>"));
-    }
-
-    #[test]
     fn datetime_section_includes_timestamp_and_timezone() {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
             tools: &tools,
-            skills: &[],
-            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
-            identity_config: None,
             dispatcher_instructions: "instr",
         };
 
@@ -431,49 +298,5 @@ mod tests {
         assert!(payload.chars().any(|c| c.is_ascii_digit()));
         assert!(payload.contains(" ("));
         assert!(payload.ends_with(')'));
-    }
-
-    #[test]
-    fn prompt_builder_inlines_and_escapes_skills() {
-        let tools: Vec<Box<dyn Tool>> = vec![];
-        let skills = vec![crate::skills::Skill {
-            name: "code<review>&".into(),
-            description: "Review \"unsafe\" and 'risky' bits".into(),
-            version: "1.0.0".into(),
-            author: None,
-            tags: vec![],
-            tools: vec![crate::skills::SkillTool {
-                name: "run\"linter\"".into(),
-                description: "Run <lint> & report".into(),
-                kind: "shell&exec".into(),
-                command: "cargo clippy".into(),
-                args: std::collections::HashMap::new(),
-            }],
-            prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
-            location: None,
-        }];
-        let ctx = PromptContext {
-            workspace_dir: Path::new("/tmp/workspace"),
-            model_name: "test-model",
-            tools: &tools,
-            skills: &skills,
-            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
-            identity_config: None,
-            dispatcher_instructions: "",
-        };
-
-        let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
-
-        assert!(prompt.contains("<available_skills>"));
-        assert!(prompt.contains("<name>code&lt;review&gt;&amp;</name>"));
-        assert!(prompt.contains(
-            "<description>Review &quot;unsafe&quot; and &apos;risky&apos; bits</description>"
-        ));
-        assert!(prompt.contains("<name>run&quot;linter&quot;</name>"));
-        assert!(prompt.contains("<description>Run &lt;lint&gt; &amp; report</description>"));
-        assert!(prompt.contains("<kind>shell&amp;exec</kind>"));
-        assert!(prompt.contains(
-            "<instruction>Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;</instruction>"
-        ));
     }
 }
