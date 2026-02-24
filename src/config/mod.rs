@@ -1,5 +1,6 @@
 pub mod schema;
 pub mod traits;
+pub mod workspace;
 
 #[allow(unused_imports)]
 pub use schema::{
@@ -8,6 +9,8 @@ pub use schema::{
     AgentConfig, AuditConfig, AutonomyConfig, ChannelsConfig, Config, GatewayConfig, MemoryConfig,
     ObservabilityConfig, ProxyConfig, ProxyScope, RuntimeConfig, SecretsConfig, SecurityConfig,
 };
+pub use traits::{ConfigIssue, ConfigIssueSeverity, ConfigLoader, ConfigValidator, Workspace};
+pub use workspace::FileWorkspace;
 
 #[cfg(test)]
 mod tests {

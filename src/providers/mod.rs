@@ -10,13 +10,16 @@
 //! in [`create_provider_with_url`]. See `AGENTS.md` §7.1 for the full change playbook.
 
 pub mod openai;
+pub mod registry;
 pub mod traits;
 
 #[allow(unused_imports)]
 pub use traits::{
-    ChatMessage, ChatRequest, ChatResponse, ConversationMessage, Provider, ProviderCapabilityError,
-    ToolCall, ToolResultMessage,
+    ChatMessage, ChatRequest, ChatResponse, ConversationMessage, EmbeddingProvider,
+    NoopEmbeddingProvider, Provider, ProviderCapabilityError, ProviderErrorKind,
+    ProviderRegistry, ToolCall, ToolResultMessage,
 };
+pub use registry::DefaultProviderRegistry;
 
 use std::path::PathBuf;
 

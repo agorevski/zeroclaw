@@ -486,6 +486,101 @@ pub fn build_tool_instructions_text(tools: &[ToolSpec]) -> String {
     instructions
 }
 
+// --- Extension traits for OpenClaw architecture parity ---
+
+/// Embedding provider for semantic vector operations.
+///
+/// Implement this trait to add a new embedding backend. The memory system
+/// uses embedding providers to convert text into vector representations
+/// for semantic similarity search.
+///
+/// NOTE: An earlier `EmbeddingProvider` trait exists in `src/memory/sqlite.rs`
+/// with a `&[&str]` signature. This trait in `providers/traits.rs` is the
+/// canonical interface going forward; new implementations should target this one.
+#[async_trait]
+pub trait EmbeddingProvider: Send + Sync {
+    /// Convert text inputs into vector embeddings.
+    async fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>>;
+    /// Return the dimensionality of the embedding vectors.
+    fn dimensions(&self) -> usize;
+    /// Return the model name used for embeddings.
+    fn model_name(&self) -> &str;
+    /// Return the provider name.
+    fn name(&self) -> &str;
+}
+
+/// No-op embedding provider that produces zero-dimensional vectors.
+#[derive(Debug, Clone, Default)]
+pub struct NoopEmbeddingProvider;
+
+#[async_trait]
+impl EmbeddingProvider for NoopEmbeddingProvider {
+    async fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        Ok(texts.iter().map(|_| vec![]).collect())
+    }
+    fn dimensions(&self) -> usize {
+        0
+    }
+    fn model_name(&self) -> &str {
+        "noop"
+    }
+    fn name(&self) -> &str {
+        "noop"
+    }
+}
+
+/// Registry for managing multiple LLM providers.
+///
+/// Provides a central place to register, resolve, and list providers.
+/// Supports fallback chains and auth profile rotation matching OpenClaw's
+/// resilience patterns.
+#[async_trait]
+pub trait ProviderRegistry: Send + Sync {
+    /// Register a provider under a given name.
+    async fn register(&self, name: &str, provider: Box<dyn Provider>) -> anyhow::Result<()>;
+    /// Look up a provider by name.
+    async fn get(&self, name: &str) -> Option<Box<dyn Provider>>;
+    /// List all registered provider names.
+    fn list(&self) -> Vec<String>;
+    /// Resolve the best available provider (considering health/fallback).
+    async fn resolve(&self, preferred: Option<&str>) -> anyhow::Result<Box<dyn Provider>>;
+    /// Return the registry name.
+    fn name(&self) -> &str;
+}
+
+/// Provider error classification for smart retry/fallback.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ProviderErrorKind {
+    Auth,
+    Billing,
+    RateLimit,
+    Capacity,
+    Network,
+    InvalidRequest,
+    Unknown,
+}
+
+/// Classify a provider error for smart retry behavior.
+pub fn classify_provider_error(error_msg: &str) -> ProviderErrorKind {
+    let lower = error_msg.to_lowercase();
+    if lower.contains("401") || lower.contains("unauthorized") || lower.contains("invalid api key")
+    {
+        ProviderErrorKind::Auth
+    } else if lower.contains("402") || lower.contains("billing") || lower.contains("quota") {
+        ProviderErrorKind::Billing
+    } else if lower.contains("429") || lower.contains("rate limit") || lower.contains("too many") {
+        ProviderErrorKind::RateLimit
+    } else if lower.contains("503") || lower.contains("capacity") || lower.contains("overloaded") {
+        ProviderErrorKind::Capacity
+    } else if lower.contains("timeout") || lower.contains("connection") || lower.contains("dns") {
+        ProviderErrorKind::Network
+    } else if lower.contains("400") || lower.contains("invalid") {
+        ProviderErrorKind::InvalidRequest
+    } else {
+        ProviderErrorKind::Unknown
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -926,6 +1021,96 @@ mod tests {
 
         assert!(text.contains("BASE"));
         assert!(text.contains("CUSTOM_TOOL_INSTRUCTIONS"));
+    }
+
+    #[test]
+    fn noop_embedding_provider_returns_empty_vectors() {
+        let provider = NoopEmbeddingProvider;
+        assert_eq!(provider.dimensions(), 0);
+        assert_eq!(provider.model_name(), "noop");
+        assert_eq!(provider.name(), "noop");
+    }
+
+    #[tokio::test]
+    async fn noop_embedding_provider_embed() {
+        let provider = NoopEmbeddingProvider;
+        let texts = vec!["hello".to_string(), "world".to_string()];
+        let result = provider.embed(&texts).await.unwrap();
+        assert_eq!(result.len(), 2);
+        assert!(result[0].is_empty());
+        assert!(result[1].is_empty());
+    }
+
+    #[test]
+    fn classify_provider_error_auth() {
+        assert_eq!(
+            classify_provider_error("401 Unauthorized"),
+            ProviderErrorKind::Auth
+        );
+        assert_eq!(
+            classify_provider_error("invalid api key provided"),
+            ProviderErrorKind::Auth
+        );
+    }
+
+    #[test]
+    fn classify_provider_error_rate_limit() {
+        assert_eq!(
+            classify_provider_error("429 Too Many Requests"),
+            ProviderErrorKind::RateLimit
+        );
+        assert_eq!(
+            classify_provider_error("rate limit exceeded"),
+            ProviderErrorKind::RateLimit
+        );
+    }
+
+    #[test]
+    fn classify_provider_error_network() {
+        assert_eq!(
+            classify_provider_error("connection timeout"),
+            ProviderErrorKind::Network
+        );
+        assert_eq!(
+            classify_provider_error("dns resolution failed"),
+            ProviderErrorKind::Network
+        );
+    }
+
+    #[test]
+    fn classify_provider_error_billing() {
+        assert_eq!(
+            classify_provider_error("402 billing issue"),
+            ProviderErrorKind::Billing
+        );
+        assert_eq!(
+            classify_provider_error("quota exceeded"),
+            ProviderErrorKind::Billing
+        );
+    }
+
+    #[test]
+    fn classify_provider_error_capacity() {
+        assert_eq!(
+            classify_provider_error("503 service overloaded"),
+            ProviderErrorKind::Capacity
+        );
+    }
+
+    #[test]
+    fn classify_provider_error_invalid_request() {
+        assert_eq!(
+            classify_provider_error("400 bad request"),
+            ProviderErrorKind::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn classify_provider_error_unknown() {
+        assert_eq!(
+            classify_provider_error("something weird happened"),
+            ProviderErrorKind::Unknown
+        );
     }
 
     #[tokio::test]
